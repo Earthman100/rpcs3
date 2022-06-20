@@ -70,7 +70,7 @@ enum lv2_socket_type : s32
 };
 
 // Socket options (prefixed with SYS_NET_)
-enum
+enum lv2_socket_option : s32
 {
 	SYS_NET_SO_SNDBUF       = 0x1001,
 	SYS_NET_SO_RCVBUF       = 0x1002,
@@ -94,6 +94,22 @@ enum
 	SYS_NET_SO_USESIGNATURE = 0x2000,
 
 	SYS_NET_SOL_SOCKET      = 0xffff,
+};
+
+// IP options (prefixed with SYS_NET_)
+enum lv2_ip_option : s32
+{
+	SYS_NET_IP_HDRINCL         = 2,
+	SYS_NET_IP_TOS             = 3,
+	SYS_NET_IP_TTL             = 4,
+	SYS_NET_IP_MULTICAST_IF    = 9,
+	SYS_NET_IP_MULTICAST_TTL   = 10,
+	SYS_NET_IP_MULTICAST_LOOP  = 11,
+	SYS_NET_IP_ADD_MEMBERSHIP  = 12,
+	SYS_NET_IP_DROP_MEMBERSHIP = 13,
+	SYS_NET_IP_TTLCHK          = 23,
+	SYS_NET_IP_MAXTTL          = 24,
+	SYS_NET_IP_DONTFRAG        = 26
 };
 
 // Family (prefixed with SYS_NET_)
@@ -132,7 +148,7 @@ enum
 };
 
 // TCP options (prefixed with SYS_NET_)
-enum
+enum lv2_tcp_option : s32
 {
 	SYS_NET_TCP_NODELAY          = 1,
 	SYS_NET_TCP_MAXSEG           = 2,
@@ -140,7 +156,7 @@ enum
 };
 
 // IP protocols (prefixed with SYS_NET_)
-enum
+enum lv2_ip_protocol : s32
 {
 	SYS_NET_IPPROTO_IP     = 0,
 	SYS_NET_IPPROTO_ICMP   = 1,
@@ -306,130 +322,6 @@ struct sys_net_linger
 	be_t<s32> l_linger;
 };
 
-// Custom structure for sockets
-// We map host sockets to sequential IDs to return as descriptors because syscalls expect socket IDs to be under 1024.
-struct lv2_socket final
-{
-#ifdef _WIN32
-	using socket_type = uptr;
-#else
-	using socket_type = int;
-#endif
-
-	static const u32 id_base = 24;
-	static const u32 id_step = 1;
-	static const u32 id_count = 1000;
-
-	// Poll events
-	enum class poll
-	{
-		read,
-		write,
-		error,
-
-		__bitset_enum_max
-	};
-
-	lv2_socket(socket_type s, s32 s_type, s32 family);
-	~lv2_socket();
-
-	shared_mutex mutex;
-
-#ifdef _WIN32
-	// Tracks connect for WSAPoll workaround
-	bool is_connecting = false;
-#endif
-
-	// Native socket (must be non-blocking)
-	socket_type socket;
-
-	// Events selected for polling
-	atomic_bs_t<poll> events{};
-
-	// Non-blocking IO option
-	s32 so_nbio = 0;
-
-	// Connection result
-	s32 so_error = 0;
-
-	// Unsupported option
-	s32 so_tcp_maxseg = 1500;
-
-	const lv2_socket_type type;
-	const lv2_socket_family family;
-
-	// SYS_NET_SOCK_DGRAM_P2P and SYS_NET_SOCK_STREAM_P2P socket specific information
-	struct p2p_i
-	{
-		// Port(actual bound port) and Virtual Port(indicated by u16 at the start of the packet)
-		u16 port = 0, vport = 0;
-		// Queue containing received packets from network_thread for SYS_NET_SOCK_DGRAM_P2P sockets
-		std::queue<std::pair<sys_net_sockaddr_in_p2p, std::vector<u8>>> data{};
-	} p2p;
-
-	struct p2ps_i
-	{
-		enum tcp_flags : u8
-		{
-			FIN = (1 << 0),
-			SYN = (1 << 1),
-			RST = (1 << 2),
-			PSH = (1 << 3),
-			ACK = (1 << 4),
-			URG = (1 << 5),
-			ECE = (1 << 6),
-			CWR = (1 << 7),
-		};
-
-		static constexpr be_t<u32> U2S_sig = (static_cast<u32>('U') << 24 | static_cast<u32>('2') << 16 | static_cast<u32>('S') << 8 | static_cast<u32>('0'));
-		static constexpr usz MAX_RECEIVED_BUFFER = (1024*1024*10);
-
-		// P2P stream socket specific
-		struct encapsulated_tcp
-		{
-			be_t<u32> signature = lv2_socket::p2ps_i::U2S_sig; // Signature to verify it's P2P Stream data
-			be_t<u32> length = 0; // Length of data
-			be_t<u64> seq = 0; // This should be u32 but changed to u64 for simplicity
-			be_t<u64> ack = 0;
-			be_t<u16> src_port = 0; // fake source tcp port
-			be_t<u16> dst_port = 0; // fake dest tcp port(should be == vport)
-			be_t<u16> checksum = 0;
-			u8 flags = 0;
-		};
-
-		enum stream_status
-		{
-			stream_closed, // Default when port is not listening nor connected
-			stream_listening, // Stream is listening, accepting SYN packets
-			stream_handshaking, // Currently handshaking
-			stream_connected, // This is an established connection(after tcp handshake)
-		};
-
-		stream_status status = stream_status::stream_closed;
-
-		usz max_backlog = 0; // set on listen
-		std::queue<s32> backlog;
-
-		u16 op_port = 0, op_vport = 0;
-		u32 op_addr = 0;
-
-		u64 data_beg_seq = 0; // Seq of first byte of received_data
-		u64 data_available = 0; // Amount of continuous data available(calculated on ACK send)
-		std::map<u64, std::vector<u8>> received_data; // holds seq/data of data received
-
-		u64 cur_seq = 0; // SEQ of next packet to be sent
-	} p2ps;
-
-	// Value keepers
-#ifdef _WIN32
-	s32 so_reuseaddr = 0;
-	s32 so_reuseport = 0;
-#endif
-
-	// Event processing workload (pair of thread id and the processing function)
-	std::vector<std::pair<u32, std::function<bool(bs_t<lv2_socket::poll>)>>> queue;
-};
-
 class ppu_thread;
 
 // Syscalls
@@ -447,7 +339,7 @@ error_code sys_net_bnet_sendmsg(ppu_thread&, s32 s, vm::cptr<sys_net_msghdr> msg
 error_code sys_net_bnet_sendto(ppu_thread&, s32 s, vm::cptr<void> buf, u32 len, s32 flags, vm::cptr<sys_net_sockaddr> addr, u32 addrlen);
 error_code sys_net_bnet_setsockopt(ppu_thread&, s32 s, s32 level, s32 optname, vm::cptr<void> optval, u32 optlen);
 error_code sys_net_bnet_shutdown(ppu_thread&, s32 s, s32 how);
-error_code sys_net_bnet_socket(ppu_thread&, s32 family, s32 type, s32 protocol);
+error_code sys_net_bnet_socket(ppu_thread&, lv2_socket_family family, lv2_socket_type type, lv2_ip_protocol protocol);
 error_code sys_net_bnet_close(ppu_thread&, s32 s);
 error_code sys_net_bnet_poll(ppu_thread&, vm::ptr<sys_net_pollfd> fds, s32 nfds, s32 ms);
 error_code sys_net_bnet_select(ppu_thread&, s32 nfds, vm::ptr<sys_net_fd_set> readfds, vm::ptr<sys_net_fd_set> writefds, vm::ptr<sys_net_fd_set> exceptfds, vm::ptr<sys_net_timeval> timeout);

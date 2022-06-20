@@ -15,11 +15,14 @@
 #pragma GCC diagnostic ignored "-Wmissing-noreturn"
 #endif
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/IR/IntrinsicsX86.h"
+#include "llvm/IR/IntrinsicsAArch64.h"
+
 #ifdef _MSC_VER
 #pragma warning(pop)
 #else
@@ -41,6 +44,18 @@ enum class i2 : char
 
 enum class i4 : char
 {
+};
+
+template <typename T>
+concept LLVMType = (std::is_pointer_v<T>) && (std::is_base_of_v<llvm::Type, std::remove_pointer_t<T>>);
+
+template <typename T>
+concept LLVMValue = (std::is_pointer_v<T>) && (std::is_base_of_v<llvm::Value, std::remove_pointer_t<T>>);
+
+template <typename T>
+concept DSLValue = requires (T& v)
+{
+	{ v.eval(std::declval<llvm::IRBuilder<>*>()) } -> LLVMValue;
 };
 
 template <typename T = void>
@@ -2881,8 +2896,12 @@ protected:
 	bool m_is_be;
 
 	// Allow PSHUFB intrinsic
+#ifdef ARCH_X64
 	bool m_use_ssse3 = true;
-
+#else
+	// TODO: fix the pshufb arm64 native impl using TBL instruction
+	bool m_use_ssse3 = false;
+#endif
 	// Allow FMA
 	bool m_use_fma = false;
 
@@ -2948,11 +2967,11 @@ public:
 	}
 
 	// Call external function: provide name and function pointer
-	template <typename RT, typename... FArgs, typename... Args>
+	template <typename RetT = void, typename RT, typename... FArgs, LLVMValue... Args>
 	llvm::CallInst* call(std::string_view lame, RT(*_func)(FArgs...), Args... args)
 	{
 		static_assert(sizeof...(FArgs) == sizeof...(Args), "spu_llvm_recompiler::call(): unexpected arg number");
-		const auto type = llvm::FunctionType::get(get_type<RT>(), {args->getType()...}, false);
+		const auto type = llvm::FunctionType::get(get_type<std::conditional_t<std::is_void_v<RetT>, RT, RetT>>(), {args->getType()...}, false);
 		const auto func = llvm::cast<llvm::Function>(m_module->getOrInsertFunction({lame.data(), lame.size()}, type).getCallee());
 #ifdef _WIN32
 		func->setCallingConv(llvm::CallingConv::Win64);
@@ -2964,6 +2983,22 @@ public:
 		inst->setCallingConv(llvm::CallingConv::Win64);
 #endif
 		return inst;
+	}
+
+	template <typename RT, typename... FArgs, DSLValue... Args> requires (sizeof...(Args) != 0)
+	auto call(std::string_view name, RT(*_func)(FArgs...), Args&&... args)
+	{
+		llvm_value_t<RT> r;
+		r.value = call(name, _func, std::forward<Args>(args).eval(m_ir)...);
+		return r;
+	}
+
+	template <typename RT, DSLValue... Args>
+	auto call(llvm::Function* func, Args&&... args)
+	{
+		llvm_value_t<RT> r;
+		r.value = m_ir->CreateCall(func, {std::forward<Args>(args).eval(m_ir)...});
+		return r;
 	}
 
 	// Bitcast with immediate constant folding
@@ -3611,31 +3646,53 @@ public:
 	template <typename T, typename = std::enable_if_t<std::is_same_v<llvm_common_t<T>, f32[4]>>>
 	static auto fre(T&& a)
 	{
+#if defined(ARCH_X64)
 		return llvm_calli<f32[4], T>{"llvm.x86.sse.rcp.ps", {std::forward<T>(a)}};
+#elif defined(ARCH_ARM64)
+		return llvm_calli<f32[4], T>{"llvm.aarch64.neon.frecpe.v4f32", {std::forward<T>(a)}};
+#endif
 	}
 
 	template <typename T, typename = std::enable_if_t<std::is_same_v<llvm_common_t<T>, f32[4]>>>
 	static auto frsqe(T&& a)
 	{
+#if defined(ARCH_X64)
 		return llvm_calli<f32[4], T>{"llvm.x86.sse.rsqrt.ps", {std::forward<T>(a)}};
+#elif defined(ARCH_ARM64)
+		return llvm_calli<f32[4], T>{"llvm.aarch64.neon.frsqrte.v4f32", {std::forward<T>(a)}};
+#endif
 	}
 
 	template <typename T, typename U, typename = std::enable_if_t<std::is_same_v<llvm_common_t<T, U>, f32[4]>>>
 	static auto fmax(T&& a, U&& b)
 	{
+#if defined(ARCH_X64)
 		return llvm_calli<f32[4], T, U>{"llvm.x86.sse.max.ps", {std::forward<T>(a), std::forward<U>(b)}};
+#elif defined(ARCH_ARM64)
+		return llvm_calli<f32[4], T, U>{"llvm.aarch64.neon.fmax.v4f32", {std::forward<T>(a), std::forward<U>(b)}};
+#endif
 	}
 
 	template <typename T, typename U, typename = std::enable_if_t<std::is_same_v<llvm_common_t<T, U>, f32[4]>>>
 	static auto fmin(T&& a, U&& b)
 	{
+#if defined(ARCH_X64)
 		return llvm_calli<f32[4], T, U>{"llvm.x86.sse.min.ps", {std::forward<T>(a), std::forward<U>(b)}};
+#elif defined(ARCH_ARM64)
+		return llvm_calli<f32[4], T, U>{"llvm.aarch64.neon.fmin.v4f32", {std::forward<T>(a), std::forward<U>(b)}};
+#endif
 	}
 
 	template <typename T, typename U, typename = std::enable_if_t<std::is_same_v<llvm_common_t<T, U>, u8[16]>>>
 	static auto vdbpsadbw(T&& a, U&& b, u8 c)
 	{
 		return llvm_calli<u16[8], T, U, llvm_const_int<u32>>{"llvm.x86.avx512.dbpsadbw.128", {std::forward<T>(a), std::forward<U>(b), llvm_const_int<u32>{c}}};
+	}
+
+	template <typename T, typename U, typename = std::enable_if_t<std::is_same_v<llvm_common_t<T, U>, f32[4]>>>
+	static auto vrangeps(T&& a, U&& b, u8 c, u8 d)
+	{
+		return llvm_calli<f32[4], T, U, llvm_const_int<u32>, T, llvm_const_int<u8>>{"llvm.x86.avx512.mask.range.ps.128", {std::forward<T>(a), std::forward<U>(b), llvm_const_int<u32>{c}, std::forward<T>(a), llvm_const_int<u8>{d}}};
 	}
 };
 
@@ -3650,20 +3707,5 @@ struct fmt_unveil<llvm::TypeSize, void>
 		return arg;
 	}
 };
-
-#ifndef _MSC_VER
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wignored-attributes"
-#endif
-
-template <>
-inline llvm::Type* cpu_translator::get_type<__m128i>()
-{
-	return llvm::VectorType::get(llvm::Type::getInt8Ty(m_context), 16, false);
-}
-
-#ifndef _MSC_VER
-#pragma GCC diagnostic pop
-#endif
 
 #endif

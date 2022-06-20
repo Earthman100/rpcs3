@@ -23,8 +23,8 @@ enum class video_renderer;
 
 enum class system_state : u32
 {
-	running,
 	stopped,
+	running,
 	paused,
 	frozen, // paused but cannot resume
 	ready,
@@ -56,7 +56,7 @@ enum class cfg_mode
 
 struct EmuCallbacks
 {
-	std::function<void(std::function<void()>)> call_after;
+	std::function<void(std::function<void()>)> call_from_main_thread;
 	std::function<void(bool)> on_run; // (start_playtime) continuing or going ingame, so start the clock
 	std::function<void()> on_pause;
 	std::function<void()> on_resume;
@@ -71,6 +71,7 @@ struct EmuCallbacks
 	std::function<std::unique_ptr<class GSFrameBase>()> get_gs_frame;
 	std::function<void()> init_gs_render;
 	std::function<std::shared_ptr<class camera_handler_base>()> get_camera_handler;
+	std::function<std::shared_ptr<class music_handler_base>()> get_music_handler;
 	std::function<std::shared_ptr<class AudioBackend>()> get_audio;
 	std::function<std::shared_ptr<class MsgDialogBase>()> get_msg_dialog;
 	std::function<std::shared_ptr<class OskDialogBase>()> get_osk_dialog;
@@ -104,6 +105,7 @@ class Emulator final
 	std::string m_title_id;
 	std::string m_title;
 	std::string m_app_version;
+	std::string m_hash;
 	std::string m_cat;
 	std::string m_dir;
 	std::string m_sfo_dir;
@@ -111,9 +113,9 @@ class Emulator final
 	std::string m_usr{"00000001"};
 	u32 m_usrid{1};
 
-	// This flag should be adjusted before each Stop() or each BootGame() and similar because:
+	// This flag should be adjusted before each Kill() or each BootGame() and similar because:
 	// 1. It forces an application to boot immediately by calling Run() in Load().
-	// 2. It signifies that we don't want to exit on Stop(), for example if we want to transition to another application.
+	// 2. It signifies that we don't want to exit on Kill(), for example if we want to transition to another application.
 	bool m_force_boot = false;
 
 	bool m_has_gui = true;
@@ -132,14 +134,14 @@ public:
 	}
 
 	// Call from the GUI thread
-	void CallAfter(std::function<void()>&& func, bool track_emu_state = true) const
+	void CallFromMainThread(std::function<void()>&& func, bool track_emu_state = true, u64 stop_ctr = umax) const
 	{
 		if (!track_emu_state)
 		{
-			return m_cb.call_after(std::move(func));
+			return m_cb.call_from_main_thread(std::move(func));
 		}
 
-		std::function<void()> final_func = [this, before = IsStopped(), count = +m_stop_ctr, func = std::move(func)]
+		std::function<void()> final_func = [this, before = IsStopped(), count = (stop_ctr == umax ? +m_stop_ctr : stop_ctr), func = std::move(func)]
 		{
 			if (count == m_stop_ctr && before == IsStopped())
 			{
@@ -147,7 +149,19 @@ public:
 			}
 		};
 
-		return m_cb.call_after(std::move(final_func));
+		return m_cb.call_from_main_thread(std::move(final_func));
+	}
+
+	enum class stop_counter_t : u64{};
+
+	stop_counter_t ProcureCurrentEmulationCourseInformation() const
+	{
+		return stop_counter_t{+m_stop_ctr};
+	}
+
+	void CallFromMainThread(std::function<void()>&& func, stop_counter_t counter) const
+	{
+		CallFromMainThread(std::move(func), true, static_cast<u64>(counter));
 	}
 
 	/** Set emulator mode to running unconditionnaly.
@@ -166,6 +180,14 @@ public:
 	std::vector<u128> klic;
 	std::string disc;
 	std::string hdd1;
+	std::function<void(u32)> init_mem_containers;
+
+	u32 m_boot_source_type = 0; // CELL_GAME_GAMETYPE_SYS
+
+	const u32& GetBootSourceType() const
+	{
+		return m_boot_source_type;
+	}
 
 	const std::string& GetBoot() const
 	{
@@ -192,6 +214,13 @@ public:
 		return m_app_version;
 	}
 
+	const std::string& GetExecutableHash() const
+	{
+		return m_hash;
+	}
+
+	void SetExecutableHash(std::string hash) { m_hash = std::move(hash); }
+
 	const std::string& GetCat() const
 	{
 		return m_cat;
@@ -204,10 +233,7 @@ public:
 		return m_dir;
 	}
 
-	const std::string& GetSfoDir() const
-	{
-		return m_sfo_dir;
-	}
+	const std::string GetSfoDir(bool prefer_disc_sfo) const;
 
 	// String for GUI dialogs.
 	const std::string& GetUsr() const
@@ -244,8 +270,9 @@ public:
 	void Run(bool start_playtime);
 	bool Pause(bool freeze_emulation = false);
 	void Resume();
-	void Stop(bool restart = false);
-	void Restart() { Stop(true); }
+	void GracefulShutdown(bool allow_autoexit = true, bool async_op = false);
+	void Kill(bool allow_autoexit = true);
+	game_boot_result Restart();
 	bool Quit(bool force_quit);
 	static void CleanUp();
 
@@ -272,6 +299,8 @@ public:
 };
 
 extern Emulator Emu;
+
+extern bool g_log_all_errors;
 
 extern bool g_use_rtm;
 extern u64 g_rtm_tx_limit1;

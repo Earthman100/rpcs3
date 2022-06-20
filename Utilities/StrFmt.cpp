@@ -13,46 +13,59 @@
 #include <Windows.h>
 #else
 #include <errno.h>
+#include <locale>
+#include <codecvt>
 #endif
 
+std::string wchar_to_utf8(std::wstring_view src)
+{
 #ifdef _WIN32
-std::string wchar_to_utf8(const wchar_t *src)
-{
 	std::string utf8_string;
-	const auto tmp_size = WideCharToMultiByte(CP_UTF8, 0, src, -1, nullptr, 0, nullptr, nullptr);
+	const auto tmp_size = WideCharToMultiByte(CP_UTF8, 0, src.data(), src.size(), nullptr, 0, nullptr, nullptr);
 	utf8_string.resize(tmp_size);
-	WideCharToMultiByte(CP_UTF8, 0, src, -1, utf8_string.data(), tmp_size, nullptr, nullptr);
+	WideCharToMultiByte(CP_UTF8, 0, src.data(), src.size(), utf8_string.data(), tmp_size, nullptr, nullptr);
 	return utf8_string;
+#else
+	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter{};
+	return converter.to_bytes(src.data());
+#endif
 }
 
-std::string wchar_path_to_ansi_path(const std::wstring& src)
+std::wstring utf8_to_wchar(std::string_view src)
 {
-	std::wstring buf_short;
-	std::string buf_final;
-
-	// Get the short path from the wide char path(short path should only contain ansi characters)
-	auto tmp_size = GetShortPathNameW(src.data(), nullptr, 0);
-	buf_short.resize(tmp_size);
-	GetShortPathNameW(src.data(), buf_short.data(), tmp_size);
-
-	// Convert wide char to ansi
-	tmp_size = WideCharToMultiByte(CP_ACP, 0, buf_short.data(), -1, nullptr, 0, nullptr, nullptr);
-	buf_final.resize(tmp_size);
-	WideCharToMultiByte(CP_ACP, 0, buf_short.data(), -1, buf_final.data(), tmp_size, nullptr, nullptr);
-
-	return buf_final;
+#ifdef _WIN32
+	std::wstring wchar_string;
+	const auto tmp_size = MultiByteToWideChar(CP_UTF8, 0, src.data(), src.size(), nullptr, 0);
+	wchar_string.resize(tmp_size);
+	MultiByteToWideChar(CP_UTF8, 0, src.data(), src.size(), wchar_string.data(), tmp_size);
+	return wchar_string;
+#else
+	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter{};
+	return converter.from_bytes(src.data());
+#endif
 }
 
-std::string utf8_path_to_ansi_path(const std::string& src)
+#ifdef _WIN32
+std::string fmt::win_error_to_string(unsigned long error, void* module_handle)
 {
-	std::wstring buf_wide;
+	std::string message;
+	LPWSTR message_buffer = nullptr;
+	if (FormatMessageW((module_handle ? FORMAT_MESSAGE_FROM_HMODULE : FORMAT_MESSAGE_FROM_SYSTEM) | FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_IGNORE_INSERTS,
+			module_handle, error, 0, (LPWSTR)&message_buffer, 0, nullptr))
+	{
+		message = fmt::format("%s (0x%x)", fmt::trim(wchar_to_utf8(message_buffer), " \t\n\r\f\v"), error);
+	}
+	else
+	{
+		message = fmt::format("0x%x", error);
+	}
 
-	// Converts the utf-8 path to wide char
-	const auto tmp_size = MultiByteToWideChar(CP_UTF8, 0, src.c_str(), -1, nullptr, 0);
-	buf_wide.resize(tmp_size);
-	MultiByteToWideChar(CP_UTF8, 0, src.c_str(), -1, buf_wide.data(), tmp_size);
+	if (message_buffer)
+	{
+		LocalFree(message_buffer);
+	}
 
-	return wchar_path_to_ansi_path(buf_wide);
+	return message;
 }
 #endif
 
@@ -131,6 +144,11 @@ void fmt_class_string<const char*>::format(std::string& out, u64 arg)
 	{
 		out += "(NULLSTR)";
 	}
+}
+
+void fmt_class_string<const wchar_t*>::format(std::string& out, u64 arg)
+{
+	out += wchar_to_utf8(reinterpret_cast<const wchar_t*>(arg));
 }
 
 template <>
@@ -353,12 +371,12 @@ void fmt_class_string<src_loc>::format(std::string& out, u64 arg)
 #ifdef _WIN32
 	if (DWORD error = GetLastError())
 	{
-		fmt::append(out, " (e=0x%08x[%u])", error, error);
+		fmt::append(out, " (error=%s)", error, fmt::win_error_to_string(error));
 	}
 #else
 	if (int error = errno)
 	{
-		fmt::append(out, " (errno=%d)", error);
+		fmt::append(out, " (errno=%d=%s)", error, strerror(errno));
 	}
 #endif
 }

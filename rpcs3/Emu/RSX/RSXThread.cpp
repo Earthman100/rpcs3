@@ -5,11 +5,14 @@
 #include "Emu/Cell/timers.hpp"
 
 #include "Common/BufferUtils.h"
+#include "Common/buffer_stream.hpp"
 #include "Common/texture_cache.h"
 #include "Common/surface_store.h"
+#include "Common/time.hpp"
 #include "Capture/rsx_capture.h"
 #include "rsx_methods.h"
 #include "gcm_printing.h"
+#include "RSXDisAsm.h"
 #include "Emu/Cell/lv2/sys_event.h"
 #include "Emu/Cell/lv2/sys_time.h"
 #include "Emu/Cell/Modules/cellGcmSys.h"
@@ -32,6 +35,7 @@ class GSRender;
 #define CMD_DEBUG 0
 
 atomic_t<bool> g_user_asked_for_frame_capture = false;
+atomic_t<bool> g_disable_frame_limit = false;
 rsx::frame_trace_data frame_debug;
 rsx::frame_capture_data frame_capture;
 
@@ -72,6 +76,12 @@ bool serialize<rsx::frame_capture_data::replay_command>(utils::serial& ar, rsx::
 namespace rsx
 {
 	std::function<bool(u32 addr, bool is_writing)> g_access_violation_handler;
+
+	rsx_iomap_table::rsx_iomap_table() noexcept
+		: ea(fill_array(-1))
+		, io(fill_array(-1))
+	{
+	}
 
 	u32 get_address(u32 offset, u32 location, u32 size_to_check, u32 line, u32 col, const char* file, const char* func)
 	{
@@ -482,6 +492,7 @@ namespace rsx
 		// This whole thing becomes a mess if we don't have a provoking attribute.
 		const auto vertex_id = vertex_push_buffers[0].get_vertex_id();
 		vertex_push_buffers[attribute].set_vertex_data(attribute, vertex_id, subreg_index, type, size, value);
+		m_graphics_state |= rsx::pipeline_state::push_buffer_arrays_dirty;
 	}
 
 	u32 thread::get_push_buffer_vertex_count() const
@@ -506,7 +517,9 @@ namespace rsx
 	void thread::end()
 	{
 		if (capture_current_frame)
+		{
 			capture::capture_draw_memory(this);
+		}
 
 		in_begin_end = false;
 		m_frame_stats.draw_calls++;
@@ -514,14 +527,20 @@ namespace rsx
 		method_registers.current_draw_clause.post_execute_cleanup();
 
 		m_graphics_state |= rsx::pipeline_state::framebuffer_reads_dirty;
+		m_eng_interrupt_mask |= rsx::backend_interrupt;
 		ROP_sync_timestamp = rsx::get_shared_tag();
 
-		for (auto & push_buf : vertex_push_buffers)
+		if (m_graphics_state & rsx::pipeline_state::push_buffer_arrays_dirty)
 		{
-			//Disabled, see https://github.com/RPCS3/rpcs3/issues/1932
-			//rsx::method_registers.register_vertex_info[index].size = 0;
+			for (auto& push_buf : vertex_push_buffers)
+			{
+				//Disabled, see https://github.com/RPCS3/rpcs3/issues/1932
+				//rsx::method_registers.register_vertex_info[index].size = 0;
 
-			push_buf.clear();
+				push_buf.clear();
+			}
+
+			m_graphics_state &= ~rsx::pipeline_state::push_buffer_arrays_dirty;
 		}
 
 		element_push_buffer.clear();
@@ -629,7 +648,7 @@ namespace rsx
 
 		fifo_ctrl = std::make_unique<::rsx::FIFO::FIFO_control>(this);
 
-		last_flip_time = get_system_time() - 1000000;
+		last_guest_flip_timestamp = rsx::uclock() - 1000000;
 
 		vblank_count = 0;
 
@@ -684,21 +703,22 @@ namespace rsx
 	
 						if (isHLE)
 						{
-							if (vblank_handler)
+							if (auto ptr = vblank_handler)
 							{
 								intr_thread->cmd_list
 								({
 									{ ppu_cmd::set_args, 1 }, u64{1},
-									{ ppu_cmd::lle_call, vblank_handler },
+									{ ppu_cmd::lle_call, ptr },
 									{ ppu_cmd::sleep, 0 }
 								});
 
+								intr_thread->cmd_notify++;
 								intr_thread->cmd_notify.notify_one();
 							}
 						}
 						else
 						{
-							sys_rsx_context_attribute(0x55555555, 0xFED, 1, post_event_time, 0, 0);
+							sys_rsx_context_attribute(0x55555555, 0xFED, 1, get_guest_system_time(post_event_time), 0, 0);
 						}
 					}
 				}
@@ -714,7 +734,7 @@ namespace rsx
 				if (Emu.IsPaused())
 				{
 					// Save the difference before pause
-					start_time = get_system_time() - start_time;
+					start_time = rsx::uclock() - start_time;
 
 					while (Emu.IsPaused() && !is_stopped())
 					{
@@ -722,7 +742,7 @@ namespace rsx
 					}
 
 					// Restore difference
-					start_time = get_system_time() - start_time;
+					start_time = rsx::uclock() - start_time;
 				}
 			}
 		});
@@ -751,11 +771,17 @@ namespace rsx
 				sync_point_request.release(false);
 			}
 
-			// Execute backend-local tasks first
-			do_local_task(performance_counters.state);
+			// Update sub-units every 64 cycles. The local handler is invoked for other functions externally on-demand anyway.
+			// This avoids expensive calls to check timestamps which involves reading some values from TLS storage on windows.
+			// If something is going on in the backend that requires an update, set the interrupt bit explicitly.
+			if ((m_cycles_counter++ & 63) == 0 || m_eng_interrupt_mask)
+			{
+				// Execute backend-local tasks first
+				do_local_task(performance_counters.state);
 
-			// Update sub-units
-			zcull_ctrl->update(this);
+				// Update other sub-units
+				zcull_ctrl->update(this);
+			}
 
 			// Execute FIFO queue
 			run_FIFO();
@@ -795,10 +821,10 @@ namespace rsx
 		float offset_z = rsx::method_registers.viewport_offset_z();
 		float one = 1.f;
 
-		stream_vector(buffer, std::bit_cast<u32>(scale_x), 0, 0, std::bit_cast<u32>(offset_x));
-		stream_vector(static_cast<char*>(buffer) + 16, 0, std::bit_cast<u32>(scale_y), 0, std::bit_cast<u32>(offset_y));
-		stream_vector(static_cast<char*>(buffer) + 32, 0, 0, std::bit_cast<u32>(scale_z), std::bit_cast<u32>(offset_z));
-		stream_vector(static_cast<char*>(buffer) + 48, 0, 0, 0, std::bit_cast<u32>(one));
+		utils::stream_vector(buffer, std::bit_cast<u32>(scale_x), 0, 0, std::bit_cast<u32>(offset_x));
+		utils::stream_vector(static_cast<char*>(buffer) + 16, 0, std::bit_cast<u32>(scale_y), 0, std::bit_cast<u32>(offset_y));
+		utils::stream_vector(static_cast<char*>(buffer) + 32, 0, 0, std::bit_cast<u32>(scale_z), std::bit_cast<u32>(offset_z));
+		utils::stream_vector(static_cast<char*>(buffer) + 48, 0, 0, 0, std::bit_cast<u32>(one));
 	}
 
 	void thread::fill_user_clip_data(void *buffer) const
@@ -849,9 +875,21 @@ namespace rsx
 	* Fill buffer with vertex program constants.
 	* Buffer must be at least 512 float4 wide.
 	*/
-	void thread::fill_vertex_program_constants_data(void* buffer)
+	void thread::fill_vertex_program_constants_data(void* buffer, const std::vector<u16>& reloc_table)
 	{
-		memcpy(buffer, rsx::method_registers.transform_constants.data(), 468 * 4 * sizeof(float));
+		if (!reloc_table.empty()) [[ likely ]]
+		{
+			char* dst = reinterpret_cast<char*>(buffer);
+			for (const auto& index : reloc_table)
+			{
+				utils::stream_vector_from_memory(dst, &rsx::method_registers.transform_constants[index]);
+				dst += 16;
+			}
+		}
+		else
+		{
+			memcpy(buffer, rsx::method_registers.transform_constants.data(), 468 * 4 * sizeof(float));
+		}
 	}
 
 	void thread::fill_fragment_state_buffer(void* buffer, const RSXFragmentProgram& /*fragment_program*/)
@@ -926,8 +964,8 @@ namespace rsx
 		const f32 alpha_ref = rsx::method_registers.alpha_ref();
 
 		u32 *dst = static_cast<u32*>(buffer);
-		stream_vector(dst, std::bit_cast<u32>(fog0), std::bit_cast<u32>(fog1), rop_control, std::bit_cast<u32>(alpha_ref));
-		stream_vector(dst + 4, 0u, fog_mode, std::bit_cast<u32>(wpos_scale), std::bit_cast<u32>(wpos_bias));
+		utils::stream_vector(dst, std::bit_cast<u32>(fog0), std::bit_cast<u32>(fog1), rop_control, std::bit_cast<u32>(alpha_ref));
+		utils::stream_vector(dst + 4, 0u, fog_mode, std::bit_cast<u32>(wpos_scale), std::bit_cast<u32>(wpos_bias));
 	}
 
 	u64 thread::timestamp()
@@ -1018,6 +1056,8 @@ namespace rsx
 
 	void thread::do_local_task(FIFO_state state)
 	{
+		m_eng_interrupt_mask.clear(rsx::backend_interrupt);
+
 		if (async_flip_requested & flip_request::emu_requested)
 		{
 			// NOTE: This has to be executed immediately
@@ -1036,6 +1076,11 @@ namespace rsx
 					handle_invalidated_memory_range();
 				}
 			}
+		}
+
+		if (m_eng_interrupt_mask & rsx::pipe_flush_interrupt)
+		{
+			sync();
 		}
 	}
 
@@ -1626,6 +1671,9 @@ namespace rsx
 
 		m_graphics_state &= ~rsx::pipeline_state::fragment_program_ucode_dirty;
 
+		// Request for update of fragment constants if the program block is invalidated
+		m_graphics_state |= rsx::pipeline_state::fragment_constants_dirty;
+
 		const auto [program_offset, program_location] = method_registers.shader_program_address();
 		const auto prev_textures_reference_mask = current_fp_metadata.referenced_textures_mask;
 
@@ -1670,6 +1718,9 @@ namespace rsx
 
 		m_graphics_state &= ~rsx::pipeline_state::vertex_program_ucode_dirty;
 
+		// Reload transform constants unconditionally for now
+		m_graphics_state |= rsx::pipeline_state::transform_constants_dirty;
+
 		const u32 transform_program_start = rsx::method_registers.transform_program_start();
 		current_vertex_program.data.reserve(512 * 4);
 		current_vertex_program.jump_table.clear();
@@ -1701,12 +1752,6 @@ namespace rsx
 
 	void thread::analyse_current_rsx_pipeline()
 	{
-		if (m_graphics_state & rsx::pipeline_state::fragment_program_ucode_dirty)
-		{
-			// Request for update of fragment constants if the program block is invalidated
-			m_graphics_state |= rsx::pipeline_state::fragment_constants_dirty;
-		}
-
 		prefetch_vertex_program();
 		prefetch_fragment_program();
 	}
@@ -1728,6 +1773,12 @@ namespace rsx
 			{
 				current_vp_texture_state.clear(i);
 				current_vp_texture_state.set_dimension(sampler_descriptors[i]->image_type, i);
+
+				if (backend_config.supports_hw_msaa &&
+					sampler_descriptors[i]->samples > 1)
+				{
+					current_vp_texture_state.multisampled_textures |= (1 << i);
+				}
 			}
 		}
 
@@ -1934,7 +1985,7 @@ namespace rsx
 			auto &tex = rsx::method_registers.fragment_textures[i];
 			current_fp_texture_state.clear(i);
 
-			if (tex.enabled())
+			if (tex.enabled() && sampler_descriptors[i]->format_class != RSX_FORMAT_CLASS_UNDEFINED)
 			{
 				current_fragment_program.texture_params[i].scale[0] = sampler_descriptors[i]->scale_x;
 				current_fragment_program.texture_params[i].scale[1] = sampler_descriptors[i]->scale_y;
@@ -1966,6 +2017,16 @@ namespace rsx
 						// This is done to work around fdiv precision issues in some GPUs (NVIDIA)
 						current_fragment_program.texture_params[i].subpixel_bias = 0.01f;
 					}
+				}
+
+				if (backend_config.supports_hw_msaa &&
+					sampler_descriptors[i]->samples > 1)
+				{
+					current_fp_texture_state.multisampled_textures |= (1 << i);
+					texture_control |= (static_cast<u32>(tex.zfunc()) << texture_control_bits::DEPTH_COMPARE_OP);
+					texture_control |= (static_cast<u32>(tex.mag_filter() != rsx::texture_magnify_filter::nearest) << texture_control_bits::FILTERED_MAG);
+					texture_control |= (static_cast<u32>(tex.min_filter() != rsx::texture_minify_filter::nearest) << texture_control_bits::FILTERED_MIN);
+					texture_control |= (((tex.format() & CELL_GCM_TEXTURE_UN) >> 6) << texture_control_bits::UNNORMALIZED_COORDS);
 				}
 
 				if (sampler_descriptors[i]->format_class != RSX_FORMAT_CLASS_COLOR)
@@ -2086,9 +2147,6 @@ namespace rsx
 					}
 				}
 
-#ifdef __APPLE__
-				texture_control |= (sampler_descriptors[i]->encoded_component_map() << 16);
-#endif
 				current_fragment_program.texture_params[i].control = texture_control;
 			}
 		}
@@ -2102,7 +2160,7 @@ namespace rsx
 			//Check that the depth stage is not disabled
 			if (!rsx::method_registers.depth_test_enabled())
 			{
-				rsx_log.error("FS exports depth component but depth test is disabled (INVALID_OPERATION)");
+				rsx_log.trace("FS exports depth component but depth test is disabled (INVALID_OPERATION)");
 			}
 		}
 	}
@@ -2126,6 +2184,9 @@ namespace rsx
 	void thread::reset()
 	{
 		rsx::method_registers.reset();
+		m_graphics_state = pipeline_state::all_dirty;
+		m_rtts_dirty = true;
+		m_framebuffer_state_contested = false;
 	}
 
 	void thread::init(u32 ctrlAddress)
@@ -2434,6 +2495,8 @@ namespace rsx
 
 	void thread::flip(const display_flip_info_t& info)
 	{
+		m_eng_interrupt_mask.clear(rsx::display_interrupt);
+
 		if (async_flip_requested & flip_request::any)
 		{
 			// Deferred flip
@@ -2451,6 +2514,8 @@ namespace rsx
 		{
 			performance_counters.sampled_frames++;
 		}
+
+		last_host_flip_timestamp = rsx::uclock();
 	}
 
 	void thread::check_zcull_status(bool framebuffer_swap)
@@ -2530,7 +2595,7 @@ namespace rsx
 			if (!result.queries.empty())
 			{
 				cond_render_ctrl.set_eval_sources(result.queries);
-				sync_hint(FIFO_hint::hint_conditional_render_eval, cond_render_ctrl.eval_sources.front());
+				sync_hint(FIFO_hint::hint_conditional_render_eval, { .query = cond_render_ctrl.eval_sources.front(), .address = ref });
 			}
 			else
 			{
@@ -2562,17 +2627,11 @@ namespace rsx
 
 	void thread::sync()
 	{
+		m_eng_interrupt_mask.clear(rsx::pipe_flush_interrupt);
+
 		if (zcull_ctrl->has_pending())
 		{
-			if (g_cfg.video.relaxed_zcull_sync)
-			{
-				// Emit zcull sync hint and update; guarantees results to be written shortly after this event
-				zcull_ctrl->update(this, 0, true);
-			}
-			else
-			{
-				zcull_ctrl->sync(this);
-			}
+			zcull_ctrl->sync(this);
 		}
 
 		// Fragment constants may have been updated
@@ -2586,9 +2645,9 @@ namespace rsx
 		//ensure(async_tasks_pending.load() == 0);
 	}
 
-	void thread::sync_hint(FIFO_hint /*hint*/, void* args)
+	void thread::sync_hint(FIFO_hint /*hint*/, rsx::reports::sync_hint_payload_t payload)
 	{
-		zcull_ctrl->on_sync_hint(args);
+		zcull_ctrl->on_sync_hint(payload);
 	}
 
 	bool thread::is_fifo_idle() const
@@ -2600,11 +2659,71 @@ namespace rsx
 	{
 		// Make sure GET value is exposed before sync points
 		fifo_ctrl->sync_get();
+		fifo_ctrl->invalidate_cache();
+	}
+
+	std::pair<u32, u32> thread::try_get_pc_of_x_cmds_backwards(u32 count, u32 get) const
+	{
+		if (!ctrl)
+		{
+			return {0, umax};
+		}
+
+		if (!count)
+		{
+			return {0, get};
+		}
+
+		u32 true_get = ctrl->get;
+		u32 start = last_known_code_start;
+
+		RSXDisAsm disasm(cpu_disasm_mode::survey_cmd_size, vm::g_sudo_addr, 0, this);
+
+		std::vector<u32> pcs_of_valid_cmds;
+		pcs_of_valid_cmds.reserve(std::min<u32>((get - start) / 16, 0x4000)); // Rough estimation of final array size
+
+		auto probe_code_region = [&](u32 probe_start) -> std::pair<u32, u32>
+		{
+			pcs_of_valid_cmds.clear();
+			pcs_of_valid_cmds.push_back(probe_start);
+
+			while (pcs_of_valid_cmds.back() < get)
+			{
+				if (u32 advance = disasm.disasm(pcs_of_valid_cmds.back()))
+				{
+					pcs_of_valid_cmds.push_back(pcs_of_valid_cmds.back() + advance);
+				}
+				else
+				{
+					return {0, get};
+				}
+			}
+
+			if (pcs_of_valid_cmds.size() == 1u || pcs_of_valid_cmds.back() != get)
+			{
+				return {0, get};
+			}
+
+			u32 found_cmds_count = std::min(count, ::size32(pcs_of_valid_cmds) - 1);
+
+			return {found_cmds_count, *(pcs_of_valid_cmds.end() - 1 - found_cmds_count)};
+		};
+
+		auto pair = probe_code_region(start);
+
+		if (!pair.first)
+		{
+			pair = probe_code_region(true_get);
+		}
+
+		return pair;
 	}
 
 	void thread::recover_fifo(u32 line, u32 col, const char* file, const char* func)
 	{
-		const u64 current_time = get_system_time();
+		bool kill_itself = g_cfg.core.rsx_fifo_accuracy == rsx_fifo_mode::as_ps3;
+
+		const u64 current_time = rsx::uclock();
 
 		if (recovered_fifo_cmds_history.size() == 20u)
 		{
@@ -2615,11 +2734,17 @@ namespace rsx
 			if (current_time - cmd_info.timestamp < 2'000'000u - std::min<u32>(g_cfg.video.driver_wakeup_delay * 700, 1'400'000))
 			{
 				// Probably hopeless
-				fmt::throw_exception("Dead FIFO commands queue state has been detected!\nTry increasing \"Driver Wake-Up Delay\" setting in Advanced settings. Called from %s", src_loc{line, col, file, func});
+				kill_itself = true;
 			}
 
 			// Erase the last command from history, keep the size of the queue the same
 			recovered_fifo_cmds_history.pop();
+		}
+
+		if (kill_itself)
+		{
+			fmt::throw_exception("Dead FIFO commands queue state has been detected!"
+				"\nTry increasing \"Driver Wake-Up Delay\" setting or setting \"RSX FIFO Accuracy\" to \"%s\", both in Advanced settings. Called from %s", std::min<rsx_fifo_mode>(rsx_fifo_mode{static_cast<u32>(g_cfg.core.rsx_fifo_accuracy.get()) + 1}, rsx_fifo_mode::atomic_ordered), src_loc{line, col, file, func});
 		}
 
 		// Error. Should reset the queue
@@ -2661,7 +2786,7 @@ namespace rsx
 
 		// Some cases do not need full delay
 		remaining = utils::aligned_div(remaining, div);
-		const u64 until = get_system_time() + remaining;
+		const u64 until = rsx::uclock() + remaining;
 
 		while (true)
 		{
@@ -2693,7 +2818,7 @@ namespace rsx
 				busy_wait(100);
 			}
 
-			const u64 current = get_system_time();
+			const u64 current = rsx::uclock();
 
 			if (current >= until)
 			{
@@ -2843,6 +2968,9 @@ namespace rsx
 				}
 			}
 
+			// Pause RSX thread momentarily to handle unmapping
+			eng_lock elock(this);
+
 			// Queue up memory invalidation
 			std::lock_guard lock(m_mtx_task);
 			const bool existing_range_valid = m_invalidated_memory_range.valid();
@@ -2864,12 +2992,16 @@ namespace rsx
 
 				m_invalidated_memory_range = unmap_range;
 			}
+
+			m_eng_interrupt_mask |= rsx::memory_config_interrupt;
 		}
 	}
 
 	// NOTE: m_mtx_task lock must be acquired before calling this method
 	void thread::handle_invalidated_memory_range()
 	{
+		m_eng_interrupt_mask.clear(rsx::memory_config_interrupt);
+
 		if (!m_invalidated_memory_range.valid())
 			return;
 
@@ -2924,7 +3056,7 @@ namespace rsx
 		//Average load over around 30 frames
 		if (!performance_counters.last_update_timestamp || performance_counters.sampled_frames > 30)
 		{
-			const auto timestamp = get_system_time();
+			const auto timestamp = rsx::uclock();
 			const auto idle = performance_counters.idle_time.load();
 			const auto elapsed = timestamp - performance_counters.last_update_timestamp;
 
@@ -3055,6 +3187,7 @@ namespace rsx
 
 			async_flip_buffer = buffer;
 			async_flip_requested |= flip_request::emu_requested;
+			m_eng_interrupt_mask |= rsx::display_interrupt;
 		}
 	}
 
@@ -3074,7 +3207,7 @@ namespace rsx
 		}
 
 		double limit = 0.;
-		switch (g_cfg.video.frame_limit)
+		switch (g_disable_frame_limit ? frame_limit_type::none : g_cfg.video.frame_limit)
 		{
 		case frame_limit_type::none: limit = 0.; break;
 		case frame_limit_type::_59_94: limit = 59.94; break;
@@ -3082,13 +3215,14 @@ namespace rsx
 		case frame_limit_type::_60: limit = 60.; break;
 		case frame_limit_type::_30: limit = 30.; break;
 		case frame_limit_type::_auto: limit = static_cast<double>(g_cfg.video.vblank_rate); break;
+		case frame_limit_type::_ps3: limit = 0.; break;
 		default:
 			break;
 		}
 
 		if (limit)
 		{
-			const u64 time = get_system_time() - Emu.GetPauseTime();
+			const u64 time = rsx::uclock() - Emu.GetPauseTime();
 			const u64 needed_us = static_cast<u64>(1000000 / limit);
 
 			if (int_flip_index == 0)
@@ -3117,16 +3251,30 @@ namespace rsx
 				}
 			}
 		}
+		else if (wait_for_flip_sema)
+		{
+			const auto& value = vm::_ref<RsxSemaphore>(device_addr + 0x30).val;
+			if (value != flip_sema_wait_val)
+			{
+				// Not yet signaled, handle it later
+				async_flip_requested |= flip_request::emu_requested;
+				async_flip_buffer = buffer;
+				return;
+			}
+
+			wait_for_flip_sema = false;
+		}
 
 		int_flip_index++;
 
 		current_display_buffer = buffer;
 		m_queued_flip.emu_flip = true;
 		m_queued_flip.in_progress = true;
+		m_queued_flip.skip_frame |= g_cfg.video.disable_video_output && !g_cfg.video.perf_overlay.perf_overlay_enabled;
 
 		flip(m_queued_flip);
 
-		last_flip_time = get_system_time() - 1000000;
+		last_guest_flip_timestamp = rsx::uclock() - 1000000;
 		flip_status = CELL_GCM_DISPLAY_FLIP_STATUS_DONE;
 		m_queued_flip.in_progress = false;
 
@@ -3136,833 +3284,17 @@ namespace rsx
 			return;
 		}
 
-		if (flip_handler)
+		if (auto ptr = flip_handler)
 		{
 			intr_thread->cmd_list
 			({
 				{ ppu_cmd::set_args, 1 }, u64{ 1 },
-				{ ppu_cmd::lle_call, flip_handler },
+				{ ppu_cmd::lle_call, ptr },
 				{ ppu_cmd::sleep, 0 }
 			});
 
 			intr_thread->cmd_notify++;
 			intr_thread->cmd_notify.notify_one();
-		}
-	}
-
-
-	namespace reports
-	{
-		ZCULL_control::ZCULL_control()
-		{
-			for (auto& query : m_occlusion_query_data)
-			{
-				m_free_occlusion_pool.push(&query);
-			}
-		}
-
-		ZCULL_control::~ZCULL_control()
-		{}
-
-		void ZCULL_control::set_active(class ::rsx::thread* ptimer, bool state, bool flush_queue)
-		{
-			if (state != host_queries_active)
-			{
-				host_queries_active = state;
-
-				if (state)
-				{
-					ensure(unit_enabled && m_current_task == nullptr);
-					allocate_new_query(ptimer);
-					begin_occlusion_query(m_current_task);
-				}
-				else
-				{
-					ensure(m_current_task);
-					if (m_current_task->num_draws)
-					{
-						end_occlusion_query(m_current_task);
-						m_current_task->active = false;
-						m_current_task->pending = true;
-						m_current_task->sync_tag = m_timer++;
-						m_current_task->timestamp = m_tsc;
-
-						m_pending_writes.push_back({});
-						m_pending_writes.back().query = m_current_task;
-						ptimer->async_tasks_pending++;
-					}
-					else
-					{
-						discard_occlusion_query(m_current_task);
-						free_query(m_current_task);
-						m_current_task->active = false;
-					}
-
-					m_current_task = nullptr;
-					update(ptimer, 0u, flush_queue);
-				}
-			}
-		}
-
-		void ZCULL_control::check_state(class ::rsx::thread* ptimer, bool flush_queue)
-		{
-			// NOTE: Only enable host queries if pixel count is active to save on resources
-			// Can optionally be enabled for either stats enabled or zpass enabled for accuracy
-			const bool data_stream_available = write_enabled && (zpass_count_enabled /*|| stats_enabled*/);
-			if (host_queries_active && !data_stream_available)
-			{
-				// Stop
-				set_active(ptimer, false, flush_queue);
-			}
-			else if (!host_queries_active && data_stream_available && unit_enabled)
-			{
-				// Start
-				set_active(ptimer, true, flush_queue);
-			}
-		}
-
-		void ZCULL_control::set_enabled(class ::rsx::thread* ptimer, bool state, bool flush_queue)
-		{
-			if (state != unit_enabled)
-			{
-				unit_enabled = state;
-				check_state(ptimer, flush_queue);
-			}
-		}
-
-		void ZCULL_control::set_status(class ::rsx::thread* ptimer, bool surface_active, bool zpass_active, bool zcull_stats_active, bool flush_queue)
-		{
-			write_enabled = surface_active;
-			zpass_count_enabled = zpass_active;
-			stats_enabled = zcull_stats_active;
-
-			check_state(ptimer, flush_queue);
-
-			// Disabled since only ZPASS is implemented right now
-			if (false) //(m_current_task && m_current_task->active)
-			{
-				// Data check
-				u32 expected_type = 0;
-				if (zpass_active) expected_type |= CELL_GCM_ZPASS_PIXEL_CNT;
-				if (zcull_stats_active) expected_type |= CELL_GCM_ZCULL_STATS;
-
-				if (m_current_task->data_type != expected_type) [[unlikely]]
-				{
-					rsx_log.error("ZCULL queue interrupted by data type change!");
-
-					// Stop+start the current setup
-					set_active(ptimer, false, false);
-					set_active(ptimer, true, false);
-				}
-			}
-		}
-
-		void ZCULL_control::read_report(::rsx::thread* ptimer, vm::addr_t sink, u32 type)
-		{
-			if (m_current_task && type == CELL_GCM_ZPASS_PIXEL_CNT)
-			{
-				m_current_task->owned = true;
-				end_occlusion_query(m_current_task);
-				m_pending_writes.push_back({});
-
-				m_current_task->active = false;
-				m_current_task->pending = true;
-				m_current_task->timestamp = m_tsc;
-				m_current_task->sync_tag = m_timer++;
-				m_pending_writes.back().query = m_current_task;
-
-				allocate_new_query(ptimer);
-				begin_occlusion_query(m_current_task);
-			}
-			else
-			{
-				// Spam; send null query down the pipeline to copy the last result
-				// Might be used to capture a timestamp (verify)
-
-				if (m_pending_writes.empty())
-				{
-					// No need to queue this if there is no pending request in the pipeline anyway
-					write(sink, ptimer->timestamp(), type, m_statistics_map[m_statistics_tag_id]);
-					return;
-				}
-
-				m_pending_writes.push_back({});
-			}
-
-			auto forwarder = &m_pending_writes.back();
-			for (auto It = m_pending_writes.rbegin(); It != m_pending_writes.rend(); It++)
-			{
-				if (!It->sink)
-				{
-					It->counter_tag = m_statistics_tag_id;
-					It->sink = sink;
-					It->type = type;
-
-					if (forwarder != &(*It))
-					{
-						// Not the last one in the chain, forward the writing operation to the last writer
-						// Usually comes from truncated queries caused by disabling the testing
-						ensure(It->query);
-
-						It->forwarder = forwarder;
-						It->query->owned = true;
-					}
-
-					continue;
-				}
-
-				break;
-			}
-
-			ptimer->async_tasks_pending++;
-
-			if (m_statistics_map[m_statistics_tag_id] != 0)
-			{
-				// Flush guaranteed results; only one positive is needed
-				update(ptimer);
-			}
-		}
-
-		void ZCULL_control::allocate_new_query(::rsx::thread* ptimer)
-		{
-			int retries = 0;
-			while (true)
-			{
-				if (!m_free_occlusion_pool.empty())
-				{
-					m_current_task = m_free_occlusion_pool.top();
-					m_free_occlusion_pool.pop();
-
-					m_current_task->data_type = 0;
-					m_current_task->num_draws = 0;
-					m_current_task->result = 0;
-					m_current_task->active = true;
-					m_current_task->owned = false;
-					m_current_task->sync_tag = 0;
-					m_current_task->timestamp = 0;
-
-					// Flags determine what kind of payload is carried by queries in the 'report'
-					if (zpass_count_enabled) m_current_task->data_type |= CELL_GCM_ZPASS_PIXEL_CNT;
-					if (stats_enabled) m_current_task->data_type |= CELL_GCM_ZCULL_STATS;
-
-					return;
-				}
-
-				if (retries > 0)
-				{
-					fmt::throw_exception("Allocation failed!");
-				}
-
-				// All slots are occupied, try to pop the earliest entry
-
-				if (!m_pending_writes.front().query)
-				{
-					// If this happens, the assert above will fire. There should never be a queue header with no work to be done
-					rsx_log.error("Close to our death.");
-				}
-
-				m_next_tsc = 0;
-				update(ptimer, m_pending_writes.front().sink);
-
-				retries++;
-			}
-		}
-
-		void ZCULL_control::free_query(occlusion_query_info* query)
-		{
-			query->pending = false;
-			m_free_occlusion_pool.push(query);
-		}
-
-		void ZCULL_control::clear(class ::rsx::thread* ptimer, u32 type)
-		{
-			if (!(type & CELL_GCM_ZPASS_PIXEL_CNT))
-			{
-				// Other types do not generate queries at the moment
-				return;
-			}
-
-			if (!m_pending_writes.empty())
-			{
-				//Remove any dangling/unclaimed queries as the information is lost anyway
-				auto valid_size = m_pending_writes.size();
-				for (auto It = m_pending_writes.rbegin(); It != m_pending_writes.rend(); ++It)
-				{
-					if (!It->sink)
-					{
-						discard_occlusion_query(It->query);
-						free_query(It->query);
-						valid_size--;
-						ptimer->async_tasks_pending--;
-						continue;
-					}
-
-					break;
-				}
-
-				m_pending_writes.resize(valid_size);
-			}
-
-			m_statistics_tag_id++;
-			m_statistics_map[m_statistics_tag_id] = 0;
-		}
-
-		void ZCULL_control::on_draw()
-		{
-			if (m_current_task)
-			{
-				m_current_task->num_draws++;
-				m_current_task->sync_tag = m_timer++;
-			}
-		}
-
-		void ZCULL_control::on_sync_hint(void* args)
-		{
-			auto query = static_cast<occlusion_query_info*>(args);
-			m_sync_tag = std::max(m_sync_tag, query->sync_tag);
-		}
-
-		void ZCULL_control::write(vm::addr_t sink, u64 timestamp, u32 type, u32 value)
-		{
-			ensure(sink);
-
-			auto scale_result = [](u32 value)
-			{
-				const auto scale = rsx::get_resolution_scale_percent();
-				const auto result = (value * 10000ull) / (scale * scale);
-				return std::max(1u, static_cast<u32>(result));
-			};
-
-			switch (type)
-			{
-			case CELL_GCM_ZPASS_PIXEL_CNT:
-				if (value)
-				{
-					value = (g_cfg.video.precise_zpass_count) ?
-						scale_result(value) :
-						u16{ umax };
-				}
-				break;
-			case CELL_GCM_ZCULL_STATS3:
-				value = value ? 0 : u16{umax};
-				break;
-			case CELL_GCM_ZCULL_STATS2:
-			case CELL_GCM_ZCULL_STATS1:
-			case CELL_GCM_ZCULL_STATS:
-			default:
-				//Not implemented
-				value = -1;
-				break;
-			}
-
-			rsx::reservation_lock<true> lock(sink, 16);
-			vm::_ref<atomic_t<CellGcmReportData>>(sink).store({ timestamp, value, 0});
-		}
-
-		void ZCULL_control::write(queued_report_write* writer, u64 timestamp, u32 value)
-		{
-			write(writer->sink, timestamp, writer->type, value);
-
-			for (auto &addr : writer->sink_alias)
-			{
-				write(addr, timestamp, writer->type, value);
-			}
-		}
-
-		void ZCULL_control::retire(::rsx::thread* ptimer, queued_report_write* writer, u32 result)
-		{
-			if (!writer->forwarder)
-			{
-				// No other queries in the chain, write result
-				const auto value = (writer->type == CELL_GCM_ZPASS_PIXEL_CNT) ? m_statistics_map[writer->counter_tag] : result;
-				write(writer, ptimer->timestamp(), value);
-			}
-
-			if (writer->query && writer->query->sync_tag == ptimer->cond_render_ctrl.eval_sync_tag)
-			{
-				bool eval_failed;
-				if (!writer->forwarder) [[likely]]
-				{
-					// Normal evaluation
-					eval_failed = (result == 0u);
-				}
-				else
-				{
-					// Eval was inserted while ZCULL was active but not enqueued to write to memory yet
-					// write(addr) -> enable_zpass_stats -> eval_condition -> write(addr)
-					// In this case, use what already exists in memory, not the current counter
-					eval_failed = (vm::_ref<CellGcmReportData>(writer->sink).value == 0u);
-				}
-
-				ptimer->cond_render_ctrl.set_eval_result(ptimer, eval_failed);
-			}
-		}
-
-		void ZCULL_control::sync(::rsx::thread* ptimer)
-		{
-			if (!m_pending_writes.empty())
-			{
-				// Quick reverse scan to push commands ahead of time
-				for (auto It = m_pending_writes.rbegin(); It != m_pending_writes.rend(); ++It)
-				{
-					if (It->query && It->query->num_draws)
-					{
-						if (It->query->sync_tag > m_sync_tag)
-						{
-							// rsx_log.trace("[Performance warning] Query hint emit during sync command.");
-							ptimer->sync_hint(FIFO_hint::hint_zcull_sync, It->query);
-						}
-
-						break;
-					}
-				}
-
-				u32 processed = 0;
-				const bool has_unclaimed = (m_pending_writes.back().sink == 0);
-
-				// Write all claimed reports unconditionally
-				for (auto &writer : m_pending_writes)
-				{
-					if (!writer.sink)
-						break;
-
-					auto query = writer.query;
-					u32 result = m_statistics_map[writer.counter_tag];
-
-					if (query)
-					{
-						ensure(query->pending);
-
-						const bool implemented = (writer.type == CELL_GCM_ZPASS_PIXEL_CNT || writer.type == CELL_GCM_ZCULL_STATS3);
-						const bool have_result = result && !g_cfg.video.precise_zpass_count;
-
-						if (implemented && !have_result && query->num_draws)
-						{
-							get_occlusion_query_result(query);
-
-							if (query->result)
-							{
-								result += query->result;
-								if (query->data_type & CELL_GCM_ZPASS_PIXEL_CNT)
-								{
-									m_statistics_map[writer.counter_tag] += query->result;
-								}
-							}
-						}
-						else
-						{
-							//Already have a hit, no need to retest
-							discard_occlusion_query(query);
-						}
-
-						free_query(query);
-					}
-
-					retire(ptimer, &writer, result);
-					processed++;
-				}
-
-				if (!has_unclaimed)
-				{
-					ensure(processed == m_pending_writes.size());
-					m_pending_writes.clear();
-				}
-				else
-				{
-					auto remaining = m_pending_writes.size() - processed;
-					ensure(remaining > 0);
-
-					if (remaining == 1)
-					{
-						m_pending_writes[0] = std::move(m_pending_writes.back());
-						m_pending_writes.resize(1);
-					}
-					else
-					{
-						std::move(m_pending_writes.begin() + processed, m_pending_writes.end(), m_pending_writes.begin());
-						m_pending_writes.resize(remaining);
-					}
-				}
-
-				//Delete all statistics caches but leave the current one
-				for (auto It = m_statistics_map.begin(); It != m_statistics_map.end(); )
-				{
-					if (It->first == m_statistics_tag_id)
-						++It;
-					else
-						It = m_statistics_map.erase(It);
-				}
-
-				//Decrement jobs counter
-				ptimer->async_tasks_pending -= processed;
-			}
-		}
-
-		void ZCULL_control::update(::rsx::thread* ptimer, u32 sync_address, bool hint)
-		{
-			if (m_pending_writes.empty())
-			{
-				return;
-			}
-
-			const auto& front = m_pending_writes.front();
-			if (!front.sink)
-			{
-				// No writables in queue, abort
-				return;
-			}
-
-			if (!sync_address)
-			{
-				if (hint || ptimer->async_tasks_pending + 0u >= max_safe_queue_depth)
-				{
-					// Prepare the whole queue for reading. This happens when zcull activity is disabled or queue is too long
-					for (auto It = m_pending_writes.rbegin(); It != m_pending_writes.rend(); ++It)
-					{
-						if (It->query)
-						{
-							if (It->query->num_draws && It->query->sync_tag > m_sync_tag)
-							{
-								ptimer->sync_hint(FIFO_hint::hint_zcull_sync, It->query);
-								ensure(It->query->sync_tag <= m_sync_tag);
-							}
-
-							break;
-						}
-					}
-				}
-
-				if (m_tsc = get_system_time(); m_tsc < m_next_tsc)
-				{
-					return;
-				}
-				else
-				{
-					// Schedule ahead
-					m_next_tsc = m_tsc + min_zcull_tick_us;
-
-					// Schedule a queue flush if needed
-					if (!g_cfg.video.relaxed_zcull_sync &&
-						front.query && front.query->num_draws && front.query->sync_tag > m_sync_tag)
-					{
-						const auto elapsed = m_tsc - front.query->timestamp;
-						if (elapsed > max_zcull_delay_us)
-						{
-							ptimer->sync_hint(FIFO_hint::hint_zcull_sync, front.query);
-							ensure(front.query->sync_tag <= m_sync_tag);
-						}
-
-						return;
-					}
-				}
-			}
-
-			u32 stat_tag_to_remove = m_statistics_tag_id;
-			u32 processed = 0;
-			for (auto &writer : m_pending_writes)
-			{
-				if (!writer.sink)
-					break;
-
-				if (writer.counter_tag != stat_tag_to_remove &&
-					stat_tag_to_remove != m_statistics_tag_id)
-				{
-					//If the stat id is different from this stat id and the queue is advancing,
-					//its guaranteed that the previous tag has no remaining writes as the queue is ordered
-					m_statistics_map.erase(stat_tag_to_remove);
-					stat_tag_to_remove = m_statistics_tag_id;
-				}
-
-				auto query = writer.query;
-				u32 result = m_statistics_map[writer.counter_tag];
-
-				const bool force_read = (sync_address != 0);
-				if (force_read && writer.sink == sync_address && !writer.forwarder)
-				{
-					// Forced reads end here
-					sync_address = 0;
-				}
-
-				if (query)
-				{
-					ensure(query->pending);
-
-					const bool implemented = (writer.type == CELL_GCM_ZPASS_PIXEL_CNT || writer.type == CELL_GCM_ZCULL_STATS3);
-					const bool have_result = result && !g_cfg.video.precise_zpass_count;
-
-					if (!implemented || !query->num_draws || have_result)
-					{
-						discard_occlusion_query(query);
-					}
-					else if (force_read || check_occlusion_query_status(query))
-					{
-						get_occlusion_query_result(query);
-
-						if (query->result)
-						{
-							result += query->result;
-							if (query->data_type & CELL_GCM_ZPASS_PIXEL_CNT)
-							{
-								m_statistics_map[writer.counter_tag] += query->result;
-							}
-						}
-					}
-					else
-					{
-						// Too early; abort
-						ensure(!force_read && implemented);
-						break;
-					}
-
-					free_query(query);
-				}
-
-				stat_tag_to_remove = writer.counter_tag;
-
-				retire(ptimer, &writer, result);
-				processed++;
-			}
-
-			if (stat_tag_to_remove != m_statistics_tag_id)
-				m_statistics_map.erase(stat_tag_to_remove);
-
-			if (processed)
-			{
-				auto remaining = m_pending_writes.size() - processed;
-				if (remaining == 1)
-				{
-					m_pending_writes[0] = std::move(m_pending_writes.back());
-					m_pending_writes.resize(1);
-				}
-				else if (remaining)
-				{
-					std::move(m_pending_writes.begin() + processed, m_pending_writes.end(), m_pending_writes.begin());
-					m_pending_writes.resize(remaining);
-				}
-				else
-				{
-					m_pending_writes.clear();
-				}
-
-				ptimer->async_tasks_pending -= processed;
-			}
-		}
-
-		flags32_t ZCULL_control::read_barrier(::rsx::thread* ptimer, u32 memory_address, u32 memory_range, flags32_t flags)
-		{
-			if (m_pending_writes.empty())
-				return result_none;
-
-			const auto memory_end = memory_address + memory_range;
-
-			AUDIT(memory_end >= memory_address);
-
-			u32 sync_address = 0;
-			occlusion_query_info* query = nullptr;
-
-			for (auto It = m_pending_writes.crbegin(); It != m_pending_writes.crend(); ++It)
-			{
-				if (sync_address)
-				{
-					if (It->query)
-					{
-						sync_address = It->sink;
-						query = It->query;
-						break;
-					}
-
-					continue;
-				}
-
-				if (It->sink >= memory_address && It->sink < memory_end)
-				{
-					sync_address = It->sink;
-
-					// NOTE: If application is spamming requests, there may be no query attached
-					if (It->query)
-					{
-						query = It->query;
-						break;
-					}
-				}
-			}
-
-			if (!sync_address || !query)
-				return result_none;
-
-			if (!(flags & sync_defer_copy))
-			{
-				if (!(flags & sync_no_notify))
-				{
-					if (query->sync_tag > m_sync_tag) [[unlikely]]
-					{
-						ptimer->sync_hint(FIFO_hint::hint_zcull_sync, query);
-						ensure(m_sync_tag >= query->sync_tag);
-					}
-				}
-
-				// There can be multiple queries all writing to the same address, loop to flush all of them
-				while (query->pending && !Emu.IsStopped())
-				{
-					update(ptimer, sync_address);
-				}
-				return result_none;
-			}
-
-			return result_zcull_intr;
-		}
-
-		flags32_t ZCULL_control::read_barrier(class ::rsx::thread* ptimer, u32 memory_address, occlusion_query_info* query)
-		{
-			while (query->pending && !Emu.IsStopped())
-			{
-				update(ptimer, memory_address);
-			}
-
-			return result_none;
-		}
-
-		query_search_result ZCULL_control::find_query(vm::addr_t sink_address, bool all)
-		{
-			query_search_result result{};
-			u32 stat_id = 0;
-
-			for (auto It = m_pending_writes.crbegin(); It != m_pending_writes.crend(); ++It)
-			{
-				if (stat_id) [[unlikely]]
-				{
-					if (It->counter_tag != stat_id)
-					{
-						if (result.found)
-						{
-							// Some result was found, return it instead
-							break;
-						}
-
-						// Zcull stats were cleared between this query and the required stats, result can only be 0
-						return { true, 0, {} };
-					}
-
-					if (It->query && It->query->num_draws)
-					{
-						result.found = true;
-						result.queries.push_back(It->query);
-
-						if (!all)
-						{
-							break;
-						}
-					}
-				}
-				else if (It->sink == sink_address)
-				{
-					if (It->query && It->query->num_draws)
-					{
-						result.found = true;
-						result.queries.push_back(It->query);
-
-						if (!all)
-						{
-							break;
-						}
-					}
-
-					stat_id = It->counter_tag;
-				}
-			}
-
-			return result;
-		}
-
-		u32 ZCULL_control::copy_reports_to(u32 start, u32 range, u32 dest)
-		{
-			u32 bytes_to_write = 0;
-			const auto memory_range = utils::address_range::start_length(start, range);
-			for (auto &writer : m_pending_writes)
-			{
-				if (!writer.sink)
-					break;
-
-				if (!writer.forwarder && memory_range.overlaps(writer.sink))
-				{
-					u32 address = (writer.sink - start) + dest;
-					writer.sink_alias.push_back(vm::cast(address));
-				}
-			}
-
-			return bytes_to_write;
-		}
-
-
-		// Conditional rendering helpers
-		void conditional_render_eval::reset()
-		{
-			eval_address = 0;
-			eval_sync_tag = 0;
-			eval_sources.clear();
-
-			eval_failed = false;
-		}
-
-		bool conditional_render_eval::disable_rendering() const
-		{
-			return (enabled && eval_failed);
-		}
-
-		bool conditional_render_eval::eval_pending() const
-		{
-			return (enabled && eval_address);
-		}
-
-		void conditional_render_eval::enable_conditional_render(::rsx::thread* pthr, u32 address)
-		{
-			if (hw_cond_active)
-			{
-				ensure(enabled);
-				pthr->end_conditional_rendering();
-			}
-
-			reset();
-
-			enabled = true;
-			eval_address = address;
-		}
-
-		void conditional_render_eval::disable_conditional_render(::rsx::thread* pthr)
-		{
-			if (hw_cond_active)
-			{
-				ensure(enabled);
-				pthr->end_conditional_rendering();
-			}
-
-			reset();
-			enabled = false;
-		}
-
-		void conditional_render_eval::set_eval_sources(std::vector<occlusion_query_info*>& sources)
-		{
-			eval_sources = std::move(sources);
-			eval_sync_tag = eval_sources.front()->sync_tag;
-		}
-
-		void conditional_render_eval::set_eval_result(::rsx::thread* pthr, bool failed)
-		{
-			if (hw_cond_active)
-			{
-				ensure(enabled);
-				pthr->end_conditional_rendering();
-			}
-
-			reset();
-			eval_failed = failed;
-		}
-
-		void conditional_render_eval::eval_result(::rsx::thread* pthr)
-		{
-			vm::ptr<CellGcmReportData> result = vm::cast(eval_address);
-			const bool failed = (result->value == 0u);
-			set_eval_result(pthr, failed);
 		}
 	}
 }

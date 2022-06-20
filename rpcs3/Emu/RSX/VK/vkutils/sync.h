@@ -16,6 +16,25 @@ namespace vk
 		gpu = 1
 	};
 
+	struct host_data_t // Pick a better name
+	{
+		u64 magic = 0xCAFEBABE;
+		u64 event_counter = 0;
+		u64 texture_load_request_event = 0;
+		u64 texture_load_complete_event = 0;
+		u64 last_label_release_event = 0;
+		u64 last_label_submit_event = 0;
+		u64 commands_complete_event = 0;
+		u64 last_label_request_timestamp = 0;
+
+		inline u64 inc_counter() volatile
+		{
+			// Workaround for volatile increment warning. GPU can see this value directly, but currently we do not modify it on the device.
+			event_counter = event_counter + 1;
+			return event_counter;
+		}
+	};
+
 	struct fence
 	{
 		atomic_t<bool> flushed = false;
@@ -24,6 +43,7 @@ namespace vk
 
 		fence(VkDevice dev);
 		~fence();
+		fence(const fence&) = delete;
 
 		void reset();
 		void signal_flushed();
@@ -43,12 +63,28 @@ namespace vk
 	public:
 		event(const render_device& dev, sync_domain domain);
 		~event();
+		event(const event&) = delete;
 
 		void signal(const command_buffer& cmd, VkPipelineStageFlags stages, VkAccessFlags access);
 		void host_signal() const;
 		void gpu_wait(const command_buffer& cmd) const;
 		VkResult status() const;
 		void reset() const;
+	};
+
+	class semaphore
+	{
+		VkSemaphore m_handle = VK_NULL_HANDLE;
+		VkDevice m_device = VK_NULL_HANDLE;
+
+		semaphore() = default;
+
+	public:
+		semaphore(const render_device& dev);
+		~semaphore();
+		semaphore(const semaphore&) = delete;
+
+		operator VkSemaphore() const;
 	};
 
 	VkResult wait_for_fence(fence* pFence, u64 timeout = 0ull);

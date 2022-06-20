@@ -23,9 +23,9 @@ void VKGSRender::reinitialize_swapchain()
 	}
 
 	// NOTE: This operation will create a hard sync point
-	close_and_submit_command_buffer(m_current_command_buffer->submit_fence);
-	m_current_command_buffer->pending = true;
+	close_and_submit_command_buffer();
 	m_current_command_buffer->reset();
+	m_current_command_buffer->begin();
 
 	for (auto &ctx : frame_context_storage)
 	{
@@ -33,7 +33,7 @@ void VKGSRender::reinitialize_swapchain()
 			continue;
 
 		// Release present image by presenting it
-		frame_context_cleanup(&ctx, true);
+		frame_context_cleanup(&ctx);
 	}
 
 	// Discard the current upscaling pipeline if any
@@ -47,13 +47,10 @@ void VKGSRender::reinitialize_swapchain()
 	{
 		rsx_log.warning("Swapchain initialization failed. Request ignored [%dx%d]", m_swapchain_dims.width, m_swapchain_dims.height);
 		swapchain_unavailable = true;
-		open_command_buffer();
 		return;
 	}
 
 	// Prepare new swapchain images for use
-	open_command_buffer();
-
 	for (u32 i = 0; i < m_swapchain->get_swap_image_count(); ++i)
 	{
 		const auto target_layout = m_swapchain->get_optimal_present_layout();
@@ -74,7 +71,7 @@ void VKGSRender::reinitialize_swapchain()
 	vk::wait_for_fence(&resize_fence);
 
 	m_current_command_buffer->reset();
-	open_command_buffer();
+	m_current_command_buffer->begin();
 
 	swapchain_unavailable = false;
 	should_reinitialize_swapchain = false;
@@ -100,7 +97,11 @@ void VKGSRender::present(vk::frame_context_t *ctx)
 			swapchain_unavailable = true;
 			break;
 		default:
-			vk::die_with_error(error);
+			// Other errors not part of rpcs3. This can be caused by 3rd party injectors with bad code, of which we have no control over.
+			// Let the application attempt to recover instead of crashing outright.
+			rsx_log.error("VkPresent returned unexpected error code %lld. Will attempt to recreate the swapchain. Please disable 3rd party injector tools.", static_cast<s64>(error));
+			swapchain_unavailable = true;
+			break;
 		}
 	}
 
@@ -156,25 +157,21 @@ void VKGSRender::queue_swap_request()
 	if (m_swapchain->is_headless())
 	{
 		m_swapchain->end_frame(*m_current_command_buffer, m_current_frame->present_image);
-		close_and_submit_command_buffer(m_current_command_buffer->submit_fence);
+		close_and_submit_command_buffer();
 	}
 	else
 	{
-		close_and_submit_command_buffer(m_current_command_buffer->submit_fence,
+		close_and_submit_command_buffer(nullptr,
 			m_current_frame->acquire_signal_semaphore,
 			m_current_frame->present_wait_semaphore,
 			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
 	}
 
-	// Signal pending state as the command queue is now closed
-	m_current_frame->swap_command_buffer->pending = true;
-
 	// Set up a present request for this frame as well
 	present(m_current_frame);
 
 	// Grab next cb in line and make it usable
-	m_current_cb_index = (m_current_cb_index + 1) % VK_MAX_ASYNC_CB_COUNT;
-	m_current_command_buffer = &m_primary_cb_list[m_current_cb_index];
+	m_current_command_buffer = m_primary_cb_list.next();
 	m_current_command_buffer->reset();
 	m_current_command_buffer->begin();
 
@@ -182,23 +179,19 @@ void VKGSRender::queue_swap_request()
 	advance_queued_frames();
 }
 
-void VKGSRender::frame_context_cleanup(vk::frame_context_t *ctx, bool free_resources)
+void VKGSRender::frame_context_cleanup(vk::frame_context_t *ctx)
 {
 	ensure(ctx->swap_command_buffer);
 
-	if (ctx->swap_command_buffer->pending)
+	// Perform hard swap here
+	if (ctx->swap_command_buffer->wait(FRAME_PRESENT_TIMEOUT) != VK_SUCCESS)
 	{
-		// Perform hard swap here
-		if (ctx->swap_command_buffer->wait(FRAME_PRESENT_TIMEOUT) != VK_SUCCESS)
-		{
-			// Lost surface/device, release swapchain
-			swapchain_unavailable = true;
-		}
-
-		free_resources = true;
+		// Lost surface/device, release swapchain
+		swapchain_unavailable = true;
 	}
 
-	if (free_resources)
+	// Resource cleanup.
+	// TODO: This is some outdated crap.
 	{
 		if (m_text_writer)
 		{
@@ -222,6 +215,8 @@ void VKGSRender::frame_context_cleanup(vk::frame_context_t *ctx, bool free_resou
 			m_overlay_manager->unlock();
 			m_overlay_manager->dispose(uids_to_dispose);
 		}
+
+		vk::get_resource_manager()->trim();
 
 		vk::reset_global_resources();
 
@@ -287,7 +282,7 @@ vk::viewable_image* VKGSRender::get_present_source(vk::present_surface_info* inf
 	// Check the surface store first
 	const auto format_bpp = rsx::get_format_block_size_in_bytes(info->format);
 	const auto overlap_info = m_rtts.get_merged_texture_memory_region(*m_current_command_buffer,
-		info->address, info->width, info->height, info->pitch, format_bpp, rsx::surface_access::shader_read);
+		info->address, info->width, info->height, info->pitch, format_bpp, rsx::surface_access::transfer_read);
 
 	if (!overlap_info.empty())
 	{
@@ -297,8 +292,8 @@ vk::viewable_image* VKGSRender::get_present_source(vk::present_surface_info* inf
 
 		if (section.base_address >= info->address)
 		{
-			const auto surface_width = surface->get_surface_width(rsx::surface_metrics::samples);
-			const auto surface_height = surface->get_surface_height(rsx::surface_metrics::samples);
+			const auto surface_width = surface->get_surface_width<rsx::surface_metrics::samples>();
+			const auto surface_height = surface->get_surface_height<rsx::surface_metrics::samples>();
 
 			if (section.base_address == info->address)
 			{
@@ -320,12 +315,11 @@ vk::viewable_image* VKGSRender::get_present_source(vk::present_surface_info* inf
 
 			if (viable)
 			{
-				surface->read_barrier(*m_current_command_buffer);
-				image_to_flip = section.surface->get_surface(rsx::surface_access::shader_read);
+				image_to_flip = section.surface->get_surface(rsx::surface_access::transfer_read);
 
 				std::tie(info->width, info->height) = rsx::apply_resolution_scale<true>(
-					std::min(surface_width, static_cast<u16>(info->width)),
-					std::min(surface_height, static_cast<u16>(info->height)));
+					std::min(surface_width, info->width),
+					std::min(surface_height, info->height));
 			}
 		}
 	}
@@ -404,7 +398,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 		if (m_current_frame->swap_command_buffer)
 		{
 			// Its possible this flip request is triggered by overlays and the flip queue is in undefined state
-			frame_context_cleanup(m_current_frame, true);
+			frame_context_cleanup(m_current_frame);
 		}
 
 		// Swap aux storage and current frame; aux storage should always be ready for use at all times
@@ -420,7 +414,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 		}
 
 		// There were no draws and back-to-back flips happened
-		frame_context_cleanup(m_current_frame, true);
+		frame_context_cleanup(m_current_frame);
 	}
 
 	if (info.skip_frame || swapchain_unavailable)
@@ -433,7 +427,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			m_current_frame->swap_command_buffer = m_current_command_buffer;
 			flush_command_queue(true);
 			vk::advance_frame_counter();
-			frame_context_cleanup(m_current_frame, true);
+			frame_context_cleanup(m_current_frame);
 		}
 
 		m_frame->flip(m_context);
@@ -446,7 +440,13 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 	u32 buffer_pitch = display_buffers[info.buffer].pitch;
 
 	u32 av_format;
-	auto& avconfig = g_fxo->get<rsx::avconf>();
+	const auto& avconfig = g_fxo->get<rsx::avconf>();
+
+	if (!buffer_width)
+	{
+		buffer_width = avconfig.resolution_x;
+		buffer_height = avconfig.resolution_y;
+	}
 
 	if (avconfig.state)
 	{
@@ -550,29 +550,16 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 	ensure(m_current_frame->present_image != umax);
 
 	// Calculate output dimensions. Done after swapchain acquisition in case it was recreated.
-	coordi aspect_ratio;
-	sizei csize = static_cast<sizei>(m_swapchain_dims);
-	sizei new_size = csize;
-
+	areai aspect_ratio;
 	if (!g_cfg.video.stretch_to_display_area)
 	{
-		const double aq = 1. * buffer_width / buffer_height;
-		const double rq = 1. * new_size.width / new_size.height;
-		const double q = aq / rq;
-
-		if (q > 1.0)
-		{
-			new_size.height = static_cast<int>(new_size.height / q);
-			aspect_ratio.y = (csize.height - new_size.height) / 2;
-		}
-		else if (q < 1.0)
-		{
-			new_size.width = static_cast<int>(new_size.width * q);
-			aspect_ratio.x = (csize.width - new_size.width) / 2;
-		}
+		const auto converted = avconfig.aspect_convert_region({ buffer_width, buffer_height }, m_swapchain_dims);
+		aspect_ratio = static_cast<areai>(converted);
 	}
-
-	aspect_ratio.size = new_size;
+	else
+	{
+		aspect_ratio = { 0, 0, s32(m_swapchain_dims.width), s32(m_swapchain_dims.height) };
+	}
 
 	// Blit contents to screen..
 	VkImage target_image = m_swapchain->get_image(m_current_frame->present_image);
@@ -585,7 +572,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 	vk::framebuffer_holder* direct_fbo = nullptr;
 	rsx::simple_array<vk::viewable_image*> calibration_src;
 
-	if (!image_to_flip || aspect_ratio.width < csize.width || aspect_ratio.height < csize.height)
+	if (!image_to_flip || aspect_ratio.x1 || aspect_ratio.y1)
 	{
 		// Clear the window background to black
 		VkClearColorValue clear_black {};
@@ -630,7 +617,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 				request.srcOffsets[0] = { 0, 0, 0 };
 				request.srcOffsets[1] = { s32(buffer_width), s32(buffer_height), 1 };
 				request.dstOffsets[0] = { 0, 0, 0 };
-				request.dstOffsets[1] = { aspect_ratio.width, aspect_ratio.height, 1 };
+				request.dstOffsets[1] = { aspect_ratio.width(), aspect_ratio.height(), 1 };
 
 				for (unsigned i = 0; i < calibration_src.size(); ++i)
 				{
@@ -658,15 +645,13 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 		else
 		{
 			// Do raw transfer here as there is no image object associated with textures owned by the driver (TODO)
-			const areai dst_rect = aspect_ratio;
 			VkImageBlit rgn = {};
-
 			rgn.srcSubresource = { image_to_flip->aspect(), 0, 0, 1 };
 			rgn.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
 			rgn.srcOffsets[0] = { 0, 0, 0 };
 			rgn.srcOffsets[1] = { s32(buffer_width), s32(buffer_height), 1 };
-			rgn.dstOffsets[0] = { dst_rect.x1, dst_rect.y1, 0 };
-			rgn.dstOffsets[1] = { dst_rect.x2, dst_rect.y2, 1 };
+			rgn.dstOffsets[0] = { aspect_ratio.x1, aspect_ratio.y1, 0 };
+			rgn.dstOffsets[1] = { aspect_ratio.x2, aspect_ratio.y2, 1 };
 
 			if (target_layout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
 			{
@@ -762,6 +747,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 
 		if (g_cfg.video.overlay)
 		{
+			// TODO: Move this to native overlay! It is both faster and easier to manage
 			if (!m_text_writer)
 			{
 				auto key = vk::get_renderpass_key(m_swapchain->get_surface_format());
@@ -771,13 +757,14 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 
 			m_text_writer->set_scale(m_frame->client_device_pixel_ratio());
 
-			m_text_writer->print_text(*m_current_command_buffer, *direct_fbo, 4,   0, direct_fbo->width(), direct_fbo->height(), fmt::format("RSX Load:                 %3d%%", get_load()));
-			m_text_writer->print_text(*m_current_command_buffer, *direct_fbo, 4,  18, direct_fbo->width(), direct_fbo->height(), fmt::format("draw calls: %17d", info.stats.draw_calls));
-			m_text_writer->print_text(*m_current_command_buffer, *direct_fbo, 4,  36, direct_fbo->width(), direct_fbo->height(), fmt::format("draw call setup: %12dus", info.stats.setup_time));
-			m_text_writer->print_text(*m_current_command_buffer, *direct_fbo, 4,  54, direct_fbo->width(), direct_fbo->height(), fmt::format("vertex upload time: %9dus", info.stats.vertex_upload_time));
-			m_text_writer->print_text(*m_current_command_buffer, *direct_fbo, 4,  72, direct_fbo->width(), direct_fbo->height(), fmt::format("texture upload time: %8dus", info.stats.textures_upload_time));
-			m_text_writer->print_text(*m_current_command_buffer, *direct_fbo, 4,  90, direct_fbo->width(), direct_fbo->height(), fmt::format("draw call execution: %8dus", info.stats.draw_exec_time));
-			m_text_writer->print_text(*m_current_command_buffer, *direct_fbo, 4, 108, direct_fbo->width(), direct_fbo->height(), fmt::format("submit and flip: %12dus", info.stats.flip_time));
+			m_text_writer->print_text(*m_current_command_buffer, *direct_fbo, 4,  0, direct_fbo->width(), direct_fbo->height(), fmt::format("RSX Load:                 %3d%%", get_load()));
+			m_text_writer->print_text(*m_current_command_buffer, *direct_fbo, 4, 18, direct_fbo->width(), direct_fbo->height(), fmt::format("draw calls: %17d", info.stats.draw_calls));
+			m_text_writer->print_text(*m_current_command_buffer, *direct_fbo, 4, 36, direct_fbo->width(), direct_fbo->height(), fmt::format("submits: %20d", info.stats.submit_count));
+			m_text_writer->print_text(*m_current_command_buffer, *direct_fbo, 4, 54, direct_fbo->width(), direct_fbo->height(), fmt::format("draw call setup: %12dus", info.stats.setup_time));
+			m_text_writer->print_text(*m_current_command_buffer, *direct_fbo, 4, 72, direct_fbo->width(), direct_fbo->height(), fmt::format("vertex upload time: %9dus", info.stats.vertex_upload_time));
+			m_text_writer->print_text(*m_current_command_buffer, *direct_fbo, 4, 90, direct_fbo->width(), direct_fbo->height(), fmt::format("texture upload time: %8dus", info.stats.textures_upload_time));
+			m_text_writer->print_text(*m_current_command_buffer, *direct_fbo, 4, 108, direct_fbo->width(), direct_fbo->height(), fmt::format("draw call execution: %8dus", info.stats.draw_exec_time));
+			m_text_writer->print_text(*m_current_command_buffer, *direct_fbo, 4, 126, direct_fbo->width(), direct_fbo->height(), fmt::format("submit and flip: %12dus", info.stats.flip_time));
 
 			const auto num_dirty_textures = m_texture_cache.get_unreleased_textures_count();
 			const auto texture_memory_size = m_texture_cache.get_texture_memory_in_use() / (1024 * 1024);

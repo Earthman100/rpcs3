@@ -15,7 +15,7 @@ u64 GLGSRender::get_cycles()
 
 GLGSRender::GLGSRender() : GSRender()
 {
-	m_shaders_cache = std::make_unique<gl::shader_cache>(m_prog_buffer, "opengl", "v1.92");
+	m_shaders_cache = std::make_unique<gl::shader_cache>(m_prog_buffer, "opengl", "v1.93");
 
 	if (g_cfg.video.disable_vertex_cache || g_cfg.video.multithreaded_rsx)
 		m_vertex_cache = std::make_unique<gl::null_vertex_cache>();
@@ -96,6 +96,7 @@ void GLGSRender::on_init_thread()
 	m_occlusion_type = g_cfg.video.precise_zpass_count ? GL_SAMPLES_PASSED : GL_ANY_SAMPLES_PASSED;
 
 	gl::init();
+	gl::set_command_context(gl_state);
 
 	//Enable adaptive vsync if vsync is requested
 	gl::set_swapinterval(g_cfg.video.vsync ? -1 : 0);
@@ -168,15 +169,13 @@ void GLGSRender::on_init_thread()
 	// Array stream buffer
 	{
 		m_gl_persistent_stream_buffer = std::make_unique<gl::texture>(GL_TEXTURE_BUFFER, 0, 0, 0, 0, GL_R8UI);
-		_SelectTexture(GL_STREAM_BUFFER_START + 0);
-		glBindTexture(GL_TEXTURE_BUFFER, m_gl_persistent_stream_buffer->id());
+		gl_state.bind_texture(GL_STREAM_BUFFER_START + 0, GL_TEXTURE_BUFFER, m_gl_persistent_stream_buffer->id());
 	}
 
 	// Register stream buffer
 	{
 		m_gl_volatile_stream_buffer = std::make_unique<gl::texture>(GL_TEXTURE_BUFFER, 0, 0, 0, 0, GL_R8UI);
-		_SelectTexture(GL_STREAM_BUFFER_START + 1);
-		glBindTexture(GL_TEXTURE_BUFFER, m_gl_volatile_stream_buffer->id());
+		gl_state.bind_texture(GL_STREAM_BUFFER_START + 1, GL_TEXTURE_BUFFER, m_gl_volatile_stream_buffer->id());
 	}
 
 	// Fallback null texture instead of relying on texture0
@@ -238,14 +237,14 @@ void GLGSRender::on_init_thread()
 		m_vertex_env_buffer = std::make_unique<gl::ring_buffer>();
 		m_texture_parameters_buffer = std::make_unique<gl::ring_buffer>();
 		m_vertex_layout_buffer = std::make_unique<gl::ring_buffer>();
-		m_index_ring_buffer = std::make_unique<gl::ring_buffer>();
+		m_index_ring_buffer = gl_caps.vendor_AMD ? std::make_unique<gl::transient_ring_buffer>() : std::make_unique<gl::ring_buffer>();
 		m_vertex_instructions_buffer = std::make_unique<gl::ring_buffer>();
 		m_fragment_instructions_buffer = std::make_unique<gl::ring_buffer>();
 		m_raster_env_ring_buffer = std::make_unique<gl::ring_buffer>();
 	}
 
 	m_attrib_ring_buffer->create(gl::buffer::target::texture, 256 * 0x100000);
-	m_index_ring_buffer->create(gl::buffer::target::element_array, 64 * 0x100000);
+	m_index_ring_buffer->create(gl::buffer::target::element_array, 16 * 0x100000);
 	m_transform_constants_buffer->create(gl::buffer::target::uniform, 64 * 0x100000);
 	m_fragment_constants_buffer->create(gl::buffer::target::uniform, 16 * 0x100000);
 	m_fragment_env_buffer->create(gl::buffer::target::uniform, 16 * 0x100000);
@@ -264,17 +263,15 @@ void GLGSRender::on_init_thread()
 
 	if (gl_caps.vendor_AMD)
 	{
-		m_identity_index_buffer = std::make_unique<gl::buffer>();
-		m_identity_index_buffer->create(gl::buffer::target::element_array, 1 * 0x100000, nullptr, gl::buffer::memory_type::host_visible);
-
 		// Initialize with 256k identity entries
-		auto* dst = reinterpret_cast<u32*>(m_identity_index_buffer->map(gl::buffer::access::write));
+		std::vector<u32> dst(256 * 1024);
 		for (u32 n = 0; n < (0x100000 >> 2); ++n)
 		{
 			dst[n] = n;
 		}
 
-		m_identity_index_buffer->unmap();
+		m_identity_index_buffer = std::make_unique<gl::buffer>();
+		m_identity_index_buffer->create(gl::buffer::target::element_array,dst.size() * sizeof(u32), dst.data(), gl::buffer::memory_type::local);
 	}
 	else if (gl_caps.vendor_NVIDIA)
 	{
@@ -368,11 +365,9 @@ void GLGSRender::on_exit()
 	// Globals
 	// TODO: Move these
 	gl::destroy_compute_tasks();
+	gl::destroy_overlay_passes();
 
-	if (gl::g_typeless_transfer_buffer)
-	{
-		gl::g_typeless_transfer_buffer.remove();
-	}
+	gl::destroy_global_texture_resources();
 
 	gl::debug::g_vis_texture.reset(); // TODO
 
@@ -613,10 +608,16 @@ void GLGSRender::clear_surface(u32 arg)
 			colormask = 0;
 			break;
 		}
+		case rsx::surface_color_format::b8:
+		{
+			rsx::get_b8_clear_color(clear_r, clear_g, clear_b, clear_a);
+			colormask = rsx::get_b8_clearmask(colormask);
+			break;
+		}
 		case rsx::surface_color_format::g8b8:
 		{
 			rsx::get_g8b8_clear_color(clear_r, clear_g, clear_b, clear_a);
-			colormask = rsx::get_g8b8_r8g8_colormask(colormask);
+			colormask = rsx::get_g8b8_r8g8_clearmask(colormask);
 			break;
 		}
 		case rsx::surface_color_format::a8b8g8r8:
@@ -624,7 +625,7 @@ void GLGSRender::clear_surface(u32 arg)
 		case rsx::surface_color_format::x8b8g8r8_z8b8g8r8:
 		{
 			rsx::get_abgr8_clear_color(clear_r, clear_g, clear_b, clear_a);
-			colormask = rsx::get_abgr8_colormask(colormask);
+			colormask = rsx::get_abgr8_clearmask(colormask);
 			break;
 		}
 		default:
@@ -638,16 +639,15 @@ void GLGSRender::clear_surface(u32 arg)
 			gl_state.clear_color(clear_r, clear_g, clear_b, clear_a);
 			mask |= GLenum(gl::buffers::color);
 
-			for (u8 index = m_rtts.m_bound_render_targets_config.first, count = 0;
-				 count < m_rtts.m_bound_render_targets_config.second;
-				 ++count, ++index)
+			int hw_index = 0;
+			for (const auto& index : m_rtts.m_bound_render_target_ids)
 			{
 				if (!full_frame)
 				{
 					m_rtts.m_bound_render_targets[index].second->write_barrier(cmd);
 				}
 
-				gl_state.color_maski(count, colormask);
+				gl_state.color_maski(hw_index++, colormask);
 			}
 
 			update_color = true;
@@ -656,8 +656,12 @@ void GLGSRender::clear_surface(u32 arg)
 
 	if (update_color || update_z)
 	{
-		const bool write_all_mask[] = { true, true, true, true };
-		m_rtts.on_write(update_color ? write_all_mask : nullptr, update_z);
+		m_rtts.on_write({ update_color, update_color, update_color, update_color }, update_z);
+	}
+
+	if (!full_frame)
+	{
+		gl_state.enable(GL_SCISSOR_TEST);
 	}
 
 	glClear(mask);
@@ -689,10 +693,13 @@ bool GLGSRender::load_program()
 	}
 
 	const bool was_interpreter = m_shader_interpreter.is_interpreter(m_program);
+	m_vertex_prog = nullptr;
+	m_fragment_prog = nullptr;
+
 	if (shadermode != shader_mode::interpreter_only) [[likely]]
 	{
 		void* pipeline_properties = nullptr;
-		m_program = m_prog_buffer.get_graphics_pipeline(current_vertex_program, current_fragment_program, pipeline_properties,
+		std::tie(m_program, m_vertex_prog, m_fragment_prog) = m_prog_buffer.get_graphics_pipeline(current_vertex_program, current_fragment_program, pipeline_properties,
 			shadermode != shader_mode::recompiler, true);
 
 		if (m_prog_buffer.check_cache_missed())
@@ -757,8 +764,6 @@ void GLGSRender::load_program_env()
 	const bool update_instruction_buffers = (!!m_interpreter_state && m_shader_interpreter.is_interpreter(m_program));
 	const bool update_raster_env = (rsx::method_registers.polygon_stipple_enabled() && !!(m_graphics_state & rsx::pipeline_state::polygon_stipple_pattern_dirty));
 
-	m_program->use();
-
 	if (manually_flush_ring_buffers)
 	{
 		if (update_fragment_env) m_fragment_env_buffer->reserve_storage_on_heap(128);
@@ -793,11 +798,17 @@ void GLGSRender::load_program_env()
 	if (update_transform_constants)
 	{
 		// Vertex constants
-		auto mapping = m_transform_constants_buffer->alloc_from_heap(8192, m_uniform_buffer_offset_align);
-		auto buf = static_cast<u8*>(mapping.first);
-		fill_vertex_program_constants_data(buf);
+		const usz transform_constants_size = (!m_vertex_prog || m_vertex_prog->has_indexed_constants) ? 8192 : m_vertex_prog->constant_ids.size() * 16;
+		if (transform_constants_size)
+		{
+			auto mapping = m_transform_constants_buffer->alloc_from_heap(static_cast<u32>(transform_constants_size), m_uniform_buffer_offset_align);
+			auto buf = static_cast<u8*>(mapping.first);
 
-		m_transform_constants_buffer->bind_range(GL_VERTEX_CONSTANT_BUFFERS_BIND_SLOT, mapping.second, 8192);
+			const std::vector<u16>& constant_ids = (transform_constants_size == 8192) ? std::vector<u16>{} : m_vertex_prog->constant_ids;
+			fill_vertex_program_constants_data(buf, constant_ids);
+
+			m_transform_constants_buffer->bind_range(GL_VERTEX_CONSTANT_BUFFERS_BIND_SLOT, mapping.second, static_cast<u32>(transform_constants_size));
+		}
 	}
 
 	if (update_fragment_constants && !update_instruction_buffers)
@@ -807,7 +818,7 @@ void GLGSRender::load_program_env()
 		auto buf = static_cast<u8*>(mapping.first);
 
 		m_prog_buffer.fill_fragment_constants_buffer({ reinterpret_cast<float*>(buf), fragment_constants_size },
-			current_fragment_program, true);
+			*ensure(m_fragment_prog), current_fragment_program, true);
 
 		m_fragment_constants_buffer->bind_range(GL_FRAGMENT_CONSTANT_BUFFERS_BIND_SLOT, mapping.second, fragment_constants_size);
 	}
@@ -947,13 +958,14 @@ bool GLGSRender::on_access_violation(u32 address, bool is_writing)
 
 	if (!result.violation_handled)
 	{
-		return false;
+		return zcull_ctrl->on_access_violation(address);
 	}
 
 	if (result.num_flushable > 0)
 	{
 		auto &task = post_flush_request(address, result);
 
+		m_eng_interrupt_mask |= rsx::backend_interrupt;
 		vm::temporary_unlock();
 		task.producer_wait();
 	}

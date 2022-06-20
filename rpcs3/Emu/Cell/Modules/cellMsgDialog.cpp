@@ -155,10 +155,17 @@ error_code open_msg_dialog(bool is_blocking, u32 type, vm::cptr<char> msgString,
 			return CELL_SYSUTIL_ERROR_BUSY;
 		}
 
+		if (s32 ret = sysutil_send_system_cmd(CELL_SYSUTIL_DRAWING_BEGIN, 0); ret < 0)
+		{
+			return CellSysutilError{ret + 0u};
+		}
+
 		g_last_user_response = CELL_MSGDIALOG_BUTTON_NONE;
 
 		const auto res = manager->create<rsx::overlays::message_dialog>()->show(is_blocking, msgString.get_ptr(), _type, [callback, userData](s32 status)
 		{
+			sysutil_send_system_cmd(CELL_SYSUTIL_DRAWING_END, 0);
+
 			if (callback)
 			{
 				sysutil_register_cb([=](ppu_thread& ppu) -> s32
@@ -179,6 +186,11 @@ error_code open_msg_dialog(bool is_blocking, u32 type, vm::cptr<char> msgString,
 		return CELL_SYSUTIL_ERROR_BUSY;
 	}
 
+	if (s32 ret = sysutil_send_system_cmd(CELL_SYSUTIL_DRAWING_BEGIN, 0); ret < 0)
+	{
+		return CellSysutilError{ret + 0u};
+	}
+
 	dlg->type = _type;
 
 	dlg->on_close = [callback, userData, wptr = std::weak_ptr<MsgDialogBase>(dlg)](s32 status)
@@ -187,6 +199,8 @@ error_code open_msg_dialog(bool is_blocking, u32 type, vm::cptr<char> msgString,
 
 		if (dlg && dlg->state.compare_and_swap_test(MsgDialogState::Open, MsgDialogState::Close))
 		{
+			sysutil_send_system_cmd(CELL_SYSUTIL_DRAWING_END, 0);
+
 			if (callback)
 			{
 				sysutil_register_cb([=](ppu_thread& ppu) -> s32
@@ -208,11 +222,14 @@ error_code open_msg_dialog(bool is_blocking, u32 type, vm::cptr<char> msgString,
 	auto& ppu = *get_current_cpu_thread();
 	lv2_obj::sleep(ppu);
 
+	// PS3 memory must not be accessed by Main thread 
+	std::string msg_string = msgString.get_ptr();
+
 	// Run asynchronously in GUI thread
-	Emu.CallAfter([&]()
+	Emu.CallFromMainThread([&, msg_string = std::move(msg_string)]()
 	{
 		g_last_user_response = CELL_MSGDIALOG_BUTTON_NONE;
-		dlg->Create(msgString.get_ptr());
+		dlg->Create(msg_string);
 		lv2_obj::awake(&ppu);
 	});
 
@@ -467,7 +484,8 @@ error_code cellMsgDialogAbort()
 		if (auto dlg = manager->get<rsx::overlays::message_dialog>())
 		{
 			g_fxo->get<msg_dlg_thread>().wait_until = 0;
-			dlg->close(false, true);
+			dlg->close(false, true); // this doesn't call on_close
+			sysutil_send_system_cmd(CELL_SYSUTIL_DRAWING_END, 0);
 			return CELL_OK;
 		}
 	}
@@ -487,6 +505,7 @@ error_code cellMsgDialogAbort()
 	g_fxo->get<msg_dlg_thread>().wait_until = 0;
 	g_fxo->get<msg_info>().remove(); // this shouldn't call on_close
 	input::SetIntercepted(false);     // so we need to reenable the pads here
+	sysutil_send_system_cmd(CELL_SYSUTIL_DRAWING_END, 0);
 
 	return CELL_OK;
 }
@@ -533,7 +552,7 @@ error_code cellMsgDialogProgressBarSetMsg(u32 progressBarIndex, vm::cptr<char> m
 		return CELL_MSGDIALOG_ERROR_PARAM;
 	}
 
-	Emu.CallAfter([=, msg = std::string{ msgString.get_ptr() }]
+	Emu.CallFromMainThread([=, msg = std::string{ msgString.get_ptr() }]
 	{
 		dlg->ProgressBarSetMsg(progressBarIndex, msg);
 	});
@@ -565,7 +584,7 @@ error_code cellMsgDialogProgressBarReset(u32 progressBarIndex)
 		return CELL_MSGDIALOG_ERROR_PARAM;
 	}
 
-	Emu.CallAfter([=]
+	Emu.CallFromMainThread([=]
 	{
 		dlg->ProgressBarReset(progressBarIndex);
 	});
@@ -597,7 +616,7 @@ error_code cellMsgDialogProgressBarInc(u32 progressBarIndex, u32 delta)
 		return CELL_MSGDIALOG_ERROR_PARAM;
 	}
 
-	Emu.CallAfter([=]
+	Emu.CallFromMainThread([=]
 	{
 		dlg->ProgressBarInc(progressBarIndex, delta);
 	});

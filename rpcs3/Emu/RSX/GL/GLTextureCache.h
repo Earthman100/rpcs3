@@ -67,14 +67,26 @@ namespace gl
 	public:
 		using baseclass::cached_texture_section;
 
-		void create(u16 w, u16 h, u16 depth, u16 mipmaps, gl::texture* image, u32 rsx_pitch, bool read_only,
+		void create(u16 w, u16 h, u16 depth, u16 mipmaps, gl::texture* image, u32 rsx_pitch, bool managed,
 				gl::texture::format gl_format = gl::texture::format::rgba, gl::texture::type gl_type = gl::texture::type::ubyte, bool swap_bytes = false)
 		{
+			if (vram_texture && !managed_texture && get_protection() == utils::protection::no)
+			{
+				// In-place image swap, still locked. Likely a color buffer that got rebound as depth buffer or vice-versa.
+				gl::as_rtt(vram_texture)->release();
+
+				if (!managed)
+				{
+					// Incoming is also an external resource, reference it immediately
+					gl::as_rtt(image)->add_ref();
+				}
+			}
+
 			auto new_texture = static_cast<gl::viewable_image*>(image);
 			ensure(!exists() || !is_managed() || vram_texture == new_texture);
 			vram_texture = new_texture;
 
-			if (read_only)
+			if (managed)
 			{
 				managed_texture.reset(vram_texture);
 			}
@@ -136,7 +148,7 @@ namespace gl
 			}
 		}
 
-		void dma_transfer(gl::command_context& /*cmd*/, gl::texture* src, const areai& /*src_area*/, const utils::address_range& /*valid_range*/, u32 pitch)
+		void dma_transfer(gl::command_context& cmd, gl::texture* src, const areai& /*src_area*/, const utils::address_range& /*valid_range*/, u32 pitch)
 		{
 			init_buffer(src);
 			glGetError();
@@ -181,7 +193,7 @@ namespace gl
 							mem_info.image_size_in_bytes *= 2;
 						}
 
-						void* out_offset = copy_image_to_buffer(pack_info, src, &scratch_mem, 0, { {}, src->size3D() }, &mem_info);
+						void* out_offset = copy_image_to_buffer(cmd, pack_info, src, &scratch_mem, 0, 0, { {}, src->size3D() }, &mem_info);
 
 						glBindBuffer(GL_SHADER_STORAGE_BUFFER, GL_NONE);
 						glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
@@ -316,9 +328,7 @@ namespace gl
 			m_fence.wait_for_signal();
 
 			ensure(offset + GLsizeiptr{size} <= pbo.size());
-			pbo.bind(buffer::target::pixel_pack);
-
-			return glMapBufferRange(GL_PIXEL_PACK_BUFFER, offset, size, GL_MAP_READ_BIT);
+			return pbo.map(offset, size, gl::buffer::access::read);
 		}
 
 		void finish_flush();
@@ -406,6 +416,11 @@ namespace gl
 			return managed_texture.get();
 		}
 
+		gl::render_target* get_render_target()
+		{
+			return gl::as_rtt(vram_texture);
+		}
+
 		gl::texture_view* get_raw_view()
 		{
 			return vram_texture->get_view(0xAAE4, rsx::default_remap_vector);
@@ -413,15 +428,7 @@ namespace gl
 
 		bool is_depth_texture() const
 		{
-			switch (vram_texture->get_internal_format())
-			{
-			case gl::texture::internal_format::depth16:
-			case gl::texture::internal_format::depth24_stencil8:
-			case gl::texture::internal_format::depth32f_stencil8:
-				return true;
-			default:
-				return false;
-			}
+			return !!(vram_texture->aspect() & gl::image_aspect::depth);
 		}
 
 		bool has_compatible_format(gl::texture* tex) const
@@ -555,13 +562,13 @@ namespace gl
 
 	protected:
 
-		gl::texture_view* create_temporary_subresource_view(gl::command_context &cmd, gl::texture** src, u32 gcm_format, u16 x, u16 y, u16 w, u16 h,
+		gl::texture_view* create_temporary_subresource_view(gl::command_context& cmd, gl::texture** src, u32 gcm_format, u16 x, u16 y, u16 w, u16 h,
 				const rsx::texture_channel_remap_t& remap_vector) override
 		{
 			return create_temporary_subresource_impl(cmd, *src, GL_NONE, GL_TEXTURE_2D, gcm_format, x, y, w, h, 1, 1, remap_vector, true);
 		}
 
-		gl::texture_view* create_temporary_subresource_view(gl::command_context &cmd, gl::texture* src, u32 gcm_format, u16 x, u16 y, u16 w, u16 h,
+		gl::texture_view* create_temporary_subresource_view(gl::command_context& cmd, gl::texture* src, u32 gcm_format, u16 x, u16 y, u16 w, u16 h,
 				const rsx::texture_channel_remap_t& remap_vector) override
 		{
 			return create_temporary_subresource_impl(cmd, src, static_cast<GLenum>(src->get_internal_format()),
@@ -634,7 +641,7 @@ namespace gl
 			copy_transfer_regions_impl(cmd, dst->image(), region);
 		}
 
-		cached_texture_section* create_new_texture(gl::command_context &cmd, const utils::address_range &rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u16 pitch,
+		cached_texture_section* create_new_texture(gl::command_context& cmd, const utils::address_range &rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u32 pitch,
 			u32 gcm_format, rsx::texture_upload_context context, rsx::texture_dimension_extended type, bool swizzled, rsx::component_order swizzle_flags, rsx::flags32_t /*flags*/) override
 		{
 			const rsx::image_section_attributes_t search_desc = { .gcm_format = gcm_format, .width = width, .height = height, .depth = depth, .mipmaps = mipmaps };
@@ -755,13 +762,13 @@ namespace gl
 			return &cached;
 		}
 
-		cached_texture_section* upload_image_from_cpu(gl::command_context &cmd, const utils::address_range& rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u16 pitch, u32 gcm_format,
+		cached_texture_section* upload_image_from_cpu(gl::command_context& cmd, const utils::address_range& rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u32 pitch, u32 gcm_format,
 			rsx::texture_upload_context context, const std::vector<rsx::subresource_layout>& subresource_layout, rsx::texture_dimension_extended type, bool input_swizzled) override
 		{
 			auto section = create_new_texture(cmd, rsx_range, width, height, depth, mipmaps, pitch, gcm_format, context, type, input_swizzled,
 				rsx::component_order::default_, 0);
 
-			gl::upload_texture(section->get_raw_texture(), gcm_format, input_swizzled, subresource_layout);
+			gl::upload_texture(cmd, section->get_raw_texture(), gcm_format, input_swizzled, subresource_layout);
 
 			section->last_write_tag = rsx::get_shared_tag();
 			return section;
@@ -798,7 +805,7 @@ namespace gl
 			{
 			default:
 				//TODO
-				warn_once("Format incompatibility detected, reporting failure to force data copy (GL_INTERNAL_FORMAT=0x%X, GCM_FORMAT=0x%X)", static_cast<u32>(ifmt), gcm_format);
+				// warn_once("Format incompatibility detected, reporting failure to force data copy (GL_INTERNAL_FORMAT=0x%X, GCM_FORMAT=0x%X)", static_cast<u32>(ifmt), gcm_format);
 				return false;
 			case CELL_GCM_TEXTURE_W16_Z16_Y16_X16_FLOAT:
 				return (ifmt == gl::texture::internal_format::rgba16f);
@@ -890,7 +897,7 @@ namespace gl
 			baseclass::on_frame_end();
 		}
 
-		bool blit(gl::command_context &cmd, rsx::blit_src_info& src, rsx::blit_dst_info& dst, bool linear_interpolate, gl_render_targets& m_rtts)
+		bool blit(gl::command_context& cmd, rsx::blit_src_info& src, rsx::blit_dst_info& dst, bool linear_interpolate, gl_render_targets& m_rtts)
 		{
 			auto result = upload_scaled_image(src, dst, linear_interpolate, cmd, m_rtts, m_hw_blitter);
 

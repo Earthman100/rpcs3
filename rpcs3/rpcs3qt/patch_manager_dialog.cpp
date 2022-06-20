@@ -19,6 +19,7 @@
 #include "qt_utils.h"
 #include "Utilities/File.h"
 #include "util/logs.hpp"
+#include "Crypto/utils.h"
 
 LOG_CHANNEL(patch_log, "PAT");
 
@@ -97,12 +98,13 @@ patch_manager_dialog::patch_manager_dialog(std::shared_ptr<gui_settings> gui_set
 		}
 		else if (button == ui->buttonBox->button(QDialogButtonBox::RestoreDefaults))
 		{
-			download_update();
+			download_update(false, true);
 		}
 	});
 	connect(m_downloader, &downloader::signal_download_error, this, [this](const QString& /*error*/)
 	{
 		QMessageBox::warning(this, tr("Patch downloader"), tr("An error occurred during the download process.\nCheck the log for more information."));
+		ui->buttonBox->button(QDialogButtonBox::RestoreDefaults)->setEnabled(true);
 	});
 	connect(m_downloader, &downloader::signal_download_finished, this, [this](const QByteArray& data)
 	{
@@ -110,9 +112,15 @@ patch_manager_dialog::patch_manager_dialog(std::shared_ptr<gui_settings> gui_set
 
 		if (!result_json)
 		{
-			QMessageBox::warning(this, tr("Patch downloader"), tr("An error occurred during the download process.\nCheck the log for more information."));
+			if (!m_download_automatic)
+			{
+				QMessageBox::warning(this, tr("Patch downloader"), tr("An error occurred during the download process.\nCheck the log for more information."));
+			}
 		}
+		ui->buttonBox->button(QDialogButtonBox::RestoreDefaults)->setEnabled(true);
 	});
+
+	download_update(true, false);
 }
 
 patch_manager_dialog::~patch_manager_dialog()
@@ -120,8 +128,6 @@ patch_manager_dialog::~patch_manager_dialog()
 	// Save gui settings
 	m_gui_settings->SetValue(gui::pm_geometry, saveGeometry());
 	m_gui_settings->SetValue(gui::pm_splitter_state, ui->splitter->saveState());
-
-	delete ui;
 }
 
 int patch_manager_dialog::exec()
@@ -738,8 +744,8 @@ bool patch_manager_dialog::is_valid_file(const QMimeData& md, QStringList* drop_
 
 	for (auto&& url : list) // Check each file in url list for valid type
 	{
-		const QString path   = url.toLocalFile(); // Convert url to filepath
-		const QFileInfo info = path;
+		const QString path = url.toLocalFile(); // Convert url to filepath
+		const QFileInfo info(path);
 
 		if (!info.fileName().endsWith("patch.yml"))
 		{
@@ -828,7 +834,29 @@ void patch_manager_dialog::dropEvent(QDropEvent* event)
 		else
 		{
 			patch_log.error("Errors found in patch file %s", path);
-			QMessageBox::critical(this, tr("Validation failed"), tr("Errors were found in the patch file.\n\nLog:\n%0").arg(QString::fromStdString(log_message.str())));
+			QString summary = QString::fromStdString(log_message.str());
+
+			if (summary.count(QLatin1Char('\n')) < 5)
+			{
+				QMessageBox::critical(this, tr("Validation failed"), tr("Errors were found in the patch file.\n\nLog:\n%0").arg(summary));
+			}
+			else
+			{
+				QString message = tr("Errors were found in the patch file.");
+				QMessageBox mb(QMessageBox::Icon::Critical, tr("Validation failed"), message, QMessageBox::Ok, this);
+				mb.setInformativeText(tr("To see the error log, please click \"Show Details\"."));
+				mb.setDetailedText(tr("%0").arg(summary));
+
+				// Smartass hack to make the unresizeable message box wide enough for the changelog
+				const int log_width = QLabel(summary).sizeHint().width();
+				while (QLabel(message).sizeHint().width() < log_width)
+				{
+					message += "          ";
+				}
+
+				mb.setText(message);
+				mb.exec();
+			}
 		}
 	}
 }
@@ -861,9 +889,14 @@ void patch_manager_dialog::dragLeaveEvent(QDragLeaveEvent* event)
 	event->accept();
 }
 
-void patch_manager_dialog::download_update() const
+void patch_manager_dialog::download_update(bool automatic, bool auto_accept)
 {
-	patch_log.notice("Patch download triggered");
+	patch_log.notice("Patch download triggered (automatic=%d, auto_accept=%d)", automatic, auto_accept);
+
+	ui->buttonBox->button(QDialogButtonBox::RestoreDefaults)->setEnabled(false);
+
+	m_download_automatic = automatic;
+	m_download_auto_accept = auto_accept;
 
 	const std::string path = patch_engine::get_patches_path() + "patch.yml";
 	std::string url        = "https://rpcs3.net/compatibility?patch&api=v1&v=" + patch_engine_version;
@@ -872,7 +905,7 @@ void patch_manager_dialog::download_update() const
 	{
 		if (const fs::file patch_file{path})
 		{
-			const std::string hash = downloader::get_hash(patch_file.to_string().c_str(), patch_file.size(), true);
+			const std::string hash = sha256_get_hash(patch_file.to_string().c_str(), patch_file.size(), true);
 			url += "&sha256=" + hash;
 		}
 		else
@@ -882,7 +915,7 @@ void patch_manager_dialog::download_update() const
 		}
 	}
 
-	m_downloader->start(url, true, true, tr("Downloading latest patches"));
+	m_downloader->start(url, true, !m_download_automatic, tr("Downloading latest patches"));
 }
 
 bool patch_manager_dialog::handle_json(const QByteArray& data)
@@ -913,7 +946,12 @@ bool patch_manager_dialog::handle_json(const QByteArray& data)
 	if (return_code == 1)
 	{
 		patch_log.notice("Patch download: No newer patches found");
-		QMessageBox::information(this, tr("Download successful"), tr("Your patch file is already up to date."));
+
+		if (!m_download_automatic)
+		{
+			QMessageBox::information(this, tr("Download successful"), tr("Your patch file is already up to date."));
+		}
+
 		return true;
 	}
 
@@ -921,6 +959,16 @@ bool patch_manager_dialog::handle_json(const QByteArray& data)
 	{
 		patch_log.error("Patch download error: unknown return code: %d", return_code);
 		return false;
+	}
+
+	// TODO: check for updates first instead of loading the whole file immediately
+	if (!m_download_auto_accept)
+	{
+		const QMessageBox::StandardButton answer = QMessageBox::question(this, tr("Update patches?"), tr("New patches are available.\n\nDo you want to update?"));
+		if (answer != QMessageBox::StandardButton::Yes)
+		{
+			return true;
+		}
 	}
 
 	const QJsonValue& version_obj = json_data["version"];
@@ -959,7 +1007,7 @@ bool patch_manager_dialog::handle_json(const QByteArray& data)
 
 	const std::string content = patch.toString().toStdString();
 
-	if (hash_obj.toString().toStdString() != downloader::get_hash(content.c_str(), content.size(), true))
+	if (hash_obj.toString().toStdString() != sha256_get_hash(content.c_str(), content.size(), true))
 	{
 		patch_log.error("JSON content does not match the provided checksum");
 		return false;
@@ -998,7 +1046,29 @@ bool patch_manager_dialog::handle_json(const QByteArray& data)
 	else
 	{
 		patch_log.error("Errors found in downloaded patch file");
-		QMessageBox::critical(this, tr("Validation failed"), tr("Errors were found in the downloaded patch file.\n\nLog:\n%0").arg(QString::fromStdString(log_message.str())));
+		QString summary = QString::fromStdString(log_message.str());
+
+		if (summary.count(QLatin1Char('\n')) < 5)
+		{
+			QMessageBox::critical(this, tr("Validation failed"), tr("Errors were found in the downloaded patch file.\n\nLog:\n%0").arg(summary));
+		}
+		else
+		{
+			QString message = tr("Errors were found in the downloaded patch file.");
+			QMessageBox mb(QMessageBox::Icon::Critical, tr("Validation failed"), message, QMessageBox::Ok, this);
+			mb.setInformativeText(tr("To see the error log, please click \"Show Details\"."));
+			mb.setDetailedText(tr("%0").arg(summary));
+
+			// Smartass hack to make the unresizeable message box wide enough for the changelog
+			const int log_width = QLabel(message).sizeHint().width();
+			while (QLabel(message).sizeHint().width() < log_width)
+			{
+				message += "          ";
+			}
+
+			mb.setText(message);
+			mb.exec();
+		}
 	}
 
 	return true;

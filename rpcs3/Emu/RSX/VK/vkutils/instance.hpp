@@ -46,9 +46,9 @@ namespace vk
 			}
 		}
 
-		bool is_supported(const char* ext)
+		bool is_supported(std::string_view ext)
 		{
-			return std::any_of(m_vk_exts.cbegin(), m_vk_exts.cend(), [&](const VkExtensionProperties& p) { return std::strcmp(p.extensionName, ext) == 0; });
+			return std::any_of(m_vk_exts.cbegin(), m_vk_exts.cend(), [&](const VkExtensionProperties& p) { return p.extensionName == ext; });
 		}
 	};
 
@@ -149,6 +149,14 @@ namespace vk
 				{
 					extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
 				}
+
+#ifdef __APPLE__
+				#define VK_MVK_MOLTENVK_EXTENSION_NAME "VK_MVK_moltenvk"
+				if (support.is_supported(VK_MVK_MOLTENVK_EXTENSION_NAME))
+				{
+					extensions.push_back(VK_MVK_MOLTENVK_EXTENSION_NAME);
+				}
+#endif
 
 				if (support.is_supported(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME))
 				{

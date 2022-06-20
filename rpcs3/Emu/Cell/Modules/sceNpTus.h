@@ -15,6 +15,30 @@ enum
 	SCE_NP_TUS_MAX_SELECTED_FRIENDS_NUM = 100,
 };
 
+enum
+{
+	SCE_NP_TUS_OPETYPE_EQUAL = 1,
+	SCE_NP_TUS_OPETYPE_NOT_EQUAL,
+	SCE_NP_TUS_OPETYPE_GREATER_THAN,
+	SCE_NP_TUS_OPETYPE_GREATER_OR_EQUAL,
+	SCE_NP_TUS_OPETYPE_LESS_THAN,
+	SCE_NP_TUS_OPETYPE_LESS_OR_EQUAL
+};
+
+enum
+{
+	SCE_NP_TUS_VARIABLE_SORTTYPE_DESCENDING_DATE = 1,
+	SCE_NP_TUS_VARIABLE_SORTTYPE_ASCENDING_DATE,
+	SCE_NP_TUS_VARIABLE_SORTTYPE_DESCENDING_VALUE,
+	SCE_NP_TUS_VARIABLE_SORTTYPE_ASCENDING_VALUE
+};
+
+enum
+{
+	SCE_NP_TUS_DATASTATUS_SORTTYPE_DESCENDING_DATE = 1,
+	SCE_NP_TUS_DATASTATUS_SORTTYPE_ASCENDING_DATE
+};
+
 enum SceNpTssStatusCodeType
 {
 	SCE_NP_TSS_STATUS_TYPE_OK,
@@ -68,46 +92,46 @@ struct SceNpTusDataStatus
 
 struct SceNpTusAddAndGetVariableOptParam
 {
-	u64 size; // TODO: correct type?
-	vm::ptr<CellRtcTick> isLastChangedDate;
-	vm::ptr<SceNpId> isLastChangedAuthorId;
+	be_t<u32> size;
+	vm::bptr<CellRtcTick> isLastChangedDate;
+	vm::bptr<SceNpId> isLastChangedAuthorId;
 };
 
 struct SceNpTusTryAndSetVariableOptParam
 {
-	u64 size; // TODO: correct type?
-	vm::ptr<CellRtcTick> isLastChangedDate;
-	vm::ptr<SceNpId> isLastChangedAuthorId;
-	vm::ptr<s64> compareValue;
+	be_t<u32> size;
+	vm::bptr<CellRtcTick> isLastChangedDate;
+	vm::bptr<SceNpId> isLastChangedAuthorId;
+	vm::bptr<s64> compareValue;
 };
 
 struct SceNpTusSetDataOptParam
 {
-	u64 size; // TODO: correct type?
-	vm::ptr<CellRtcTick> isLastChangedDate;
-	vm::ptr<SceNpId> isLastChangedAuthorId;
+	be_t<u32> size;
+	vm::bptr<CellRtcTick> isLastChangedDate;
+	vm::bptr<SceNpId> isLastChangedAuthorId;
 };
 
 struct SceNpTssDataStatus
 {
 	CellRtcTick lastModified;
-	s32 statusCodeType;
-	u64 contentLength;
+	be_t<s32> statusCodeType;
+	be_t<u32> contentLength;
 };
 
 struct SceNpTssIfModifiedSinceParam
 {
-	s32 ifType;
+	be_t<s32> ifType;
 	u8 padding[4];
 	CellRtcTick lastModified;
 };
 
 struct SceNpTssGetDataOptParam
 {
-	u64 size; // TODO: correct type?
-	vm::ptr<u64> offset;
-	vm::ptr<u64> lastByte;
-	vm::ptr<SceNpTssIfModifiedSinceParam> ifParam;
+	be_t<u32> size;
+	vm::bptr<u64> offset;
+	vm::bptr<u64> lastByte;
+	vm::bptr<SceNpTssIfModifiedSinceParam> ifParam;
 };
 
 // fxm objects

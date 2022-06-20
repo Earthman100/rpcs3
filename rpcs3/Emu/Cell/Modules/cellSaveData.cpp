@@ -120,6 +120,91 @@ struct savedata_manager
 	atomic_t<s32> last_cbresult_error_dialog{0}; // CBRESULT errors are negative
 };
 
+int check_filename(std::string_view file_path, bool disallow_system_files, bool account_sfo_pfd)
+{
+	if (file_path.size() >= CELL_SAVEDATA_FILENAME_SIZE)
+	{
+		// ****** sysutil savedata parameter error : 71 ******
+		return 71;
+	}
+
+	auto dotpos = file_path.find_last_of('.');
+
+	if (dotpos == umax)
+	{
+		// Point to end of string instead
+		dotpos = file_path.size();
+	}
+
+	if (file_path.empty() || dotpos > 8u || file_path.size() - dotpos > 4u)
+	{
+		// ****** sysutil savedata parameter error : 70 ******
+		return 70;
+	}
+
+	if (file_path == "."sv || (!account_sfo_pfd && (file_path == "PARAM.SFO"sv || file_path == "PARAM.PFD"sv)))
+	{
+		// ****** sysutil savedata parameter error : 70 ******
+		return 70;
+	}
+
+	char name[CELL_SAVEDATA_FILENAME_SIZE - 3];
+
+	if (dotpos)
+	{
+		// Copy file name
+		std::span dst(name, dotpos + 1);
+		strcpy_trunc(dst, file_path);
+
+		// Allow multiple '.' even though sysutil_check_name_string does not
+		std::replace(name, name + dotpos, '.', '-');
+
+		// Allow '_' at start even though sysutil_check_name_string does not
+		if (name[0] == '_')
+		{
+			name[0] = '-';
+		}
+
+		if (disallow_system_files && ((dotpos >= 5u && std::memcmp(name, "PARAM", 5) == 0) ||
+			(dotpos >= 4u && std::memcmp(name, "ICON", 4) == 0) ||
+			(dotpos >= 3u && std::memcmp(name, "PIC", 3) == 0) ||
+			(dotpos >= 3u && std::memcmp(name, "SND", 3) == 0)))
+		{
+			// ****** sysutil savedata parameter error : 70 ******
+			return 70;
+		}
+
+		// Check filename
+		if (sysutil_check_name_string(name, 1, 9) == -1)
+		{
+			// ****** sysutil savedata parameter error : 70 ******
+			return 70;
+		}
+	}
+
+	if (file_path.size() > dotpos + 1)
+	{
+		// Copy file extension
+		std::span dst(name, file_path.size() - dotpos);
+		strcpy_trunc(dst, file_path.substr(dotpos + 1));
+
+		// Allow '_' at start even though sysutil_check_name_string does not
+		if (name[0] == '_')
+		{
+			name[0] = '-';
+		}
+
+		// Check file extension
+		if (sysutil_check_name_string(name, 1, 4) == -1)
+		{
+			// ****** sysutil savedata parameter error : 70 ******
+			return 70;
+		}
+	}
+
+	return 0;
+}
+
 static std::vector<SaveDataEntry> get_save_entries(const std::string& base_dir, const std::string& prefix)
 {
 	std::vector<SaveDataEntry> save_entries;
@@ -151,15 +236,15 @@ static std::vector<SaveDataEntry> get_save_entries(const std::string& base_dir, 
 		}
 
 		SaveDataEntry save_entry;
-		save_entry.dirName   = psf.at("SAVEDATA_DIRECTORY").as_string();
-		save_entry.listParam = psf.at("SAVEDATA_LIST_PARAM").as_string();
-		save_entry.title     = psf.at("TITLE").as_string();
-		save_entry.subtitle  = psf.at("SUB_TITLE").as_string();
-		save_entry.details   = psf.at("DETAIL").as_string();
+		save_entry.dirName   = psf::get_string(psf, "SAVEDATA_DIRECTORY");
+		save_entry.listParam = psf::get_string(psf, "SAVEDATA_LIST_PARAM");
+		save_entry.title     = psf::get_string(psf, "TITLE");
+		save_entry.subtitle  = psf::get_string(psf, "SUB_TITLE");
+		save_entry.details   = psf::get_string(psf, "DETAIL");
 
 		for (const auto& entry2 : fs::dir(base_dir + entry.name))
 		{
-			if (entry2.is_directory)
+			if (entry2.is_directory || check_filename(vfs::unescape(entry2.name), false, true))
 			{
 				continue;
 			}
@@ -678,15 +763,15 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 						}
 
 						SaveDataEntry save_entry2;
-						save_entry2.dirName = psf.at("SAVEDATA_DIRECTORY").as_string();
-						save_entry2.listParam = psf.at("SAVEDATA_LIST_PARAM").as_string();
-						save_entry2.title = psf.at("TITLE").as_string();
-						save_entry2.subtitle = psf.at("SUB_TITLE").as_string();
-						save_entry2.details = psf.at("DETAIL").as_string();
+						save_entry2.dirName   = psf::get_string(psf, "SAVEDATA_DIRECTORY");
+						save_entry2.listParam = psf::get_string(psf, "SAVEDATA_LIST_PARAM");
+						save_entry2.title     = psf::get_string(psf, "TITLE");
+						save_entry2.subtitle  = psf::get_string(psf, "SUB_TITLE");
+						save_entry2.details   = psf::get_string(psf, "DETAIL");
 
 						for (const auto& entry2 : fs::dir(base_dir + entry.name))
 						{
-							if (entry2.is_directory)
+							if (entry2.is_directory || check_filename(vfs::unescape(entry2.name), false, true))
 							{
 								continue;
 							}
@@ -960,8 +1045,14 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 					return {CELL_SAVEDATA_ERROR_PARAM, "34"};
 				}
 
-				// TODO: If adding the new data to the save_entries vector
-				// to be displayed in the save mangaer UI, it should be focused here
+				if (listSet->newData->iconPosition == CELL_SAVEDATA_ICONPOS_TAIL)
+				{
+					focused = ::size32(save_entries);
+				}
+				else
+				{
+					focused = 0;
+				}
 				break;
 			}
 			default:
@@ -1291,8 +1382,8 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 	// This section contains the list of files in the save ordered as they would be in BSD filesystem
 	std::vector<std::string> blist;
 
-	if (psf.count("RPCS3_BLIST"))
-		blist = fmt::split(psf.at("RPCS3_BLIST").as_string(), {"/"}, false);
+	if (const auto it = psf.find("RPCS3_BLIST"); it != psf.cend())
+		blist = fmt::split(it->second.as_string(), {"/"}, false);
 
 	// Get save stats
 	{
@@ -1318,12 +1409,12 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 
 		if (!psf.empty())
 		{
-			statGet->getParam.parental_level = psf.at("PARENTAL_LEVEL").as_integer();
-			statGet->getParam.attribute = psf.at("ATTRIBUTE").as_integer(); // ???
-			strcpy_trunc(statGet->getParam.title, save_entry.title = psf.at("TITLE").as_string());
-			strcpy_trunc(statGet->getParam.subTitle, save_entry.subtitle = psf.at("SUB_TITLE").as_string());
-			strcpy_trunc(statGet->getParam.detail, save_entry.details = psf.at("DETAIL").as_string());
-			strcpy_trunc(statGet->getParam.listParam, save_entry.listParam = psf.at("SAVEDATA_LIST_PARAM").as_string());
+			statGet->getParam.parental_level = psf::get_integer(psf, "PARENTAL_LEVEL");
+			statGet->getParam.attribute = psf::get_integer(psf, "ATTRIBUTE"); // ???
+			strcpy_trunc(statGet->getParam.title, save_entry.title = psf::get_string(psf, "TITLE"));
+			strcpy_trunc(statGet->getParam.subTitle, save_entry.subtitle = psf::get_string(psf, "SUB_TITLE"));
+			strcpy_trunc(statGet->getParam.detail, save_entry.details = psf::get_string(psf, "DETAIL"));
+			strcpy_trunc(statGet->getParam.listParam, save_entry.listParam = psf::get_string(psf, "SAVEDATA_LIST_PARAM"));
 		}
 
 		statGet->bind = 0;
@@ -1350,12 +1441,7 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 
 			if (!entry.is_directory)
 			{
-				if (entry.name == "."sv)
-				{
-					continue;
-				}
-
-				if (entry.name == "PARAM.SFO"sv || entry.name == "PARAM.PFD"sv)
+				if (check_filename(entry.name, false, false))
 				{
 					continue; // system files are not included in the file list
 				}
@@ -1575,7 +1661,7 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 			// Read file into a vector and make a memory file
 			entry.name = vfs::unescape(entry.name);
 
-			if (entry.name == ".")
+			if (check_filename(entry.name, false, true))
 			{
 				continue;
 			}
@@ -1647,83 +1733,10 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 				break;
 			}
 
-			auto dotpos = file_path.find_last_of('.');
-
-			if (dotpos == umax)
+			if (int error = check_filename(file_path, true, false))
 			{
-				// Point to end of string instead
-				dotpos = file_path.size();
-			}
-
-			if (file_path.empty() || dotpos > 8u || file_path.size() - dotpos > 4u)
-			{
-				cellSaveData.error("savedata_op(): fileSet->fileName is illegal ('%s')", file_path);
-
-				// ****** sysutil savedata parameter error : 70 ******
-				savedata_result = {CELL_SAVEDATA_ERROR_PARAM, "70"};
+				savedata_result = {CELL_SAVEDATA_ERROR_PARAM, "%d", error};
 				break;
-			}
-
-			char name[10];
-
-			if (dotpos)
-			{
-				// Copy file name
-				std::span dst(name, dotpos + 1);
-				strcpy_trunc(dst, file_path);
-
-				// Allow multiple '.' even though sysutil_check_name_string does not
-				std::replace(name, name + dotpos, '.', '-');
-
-				// Allow '_' at start even though sysutil_check_name_string does not
-				if (name[0] == '_')
-				{
-					name[0] = '-';
-				}
-
-				if ((dotpos >= 5u && std::memcmp(name, "PARAM", 5) == 0) ||
-					(dotpos >= 4u && std::memcmp(name, "ICON", 4) == 0) ||
-					(dotpos >= 3u && std::memcmp(name, "PIC", 3) == 0) ||
-					(dotpos >= 3u && std::memcmp(name, "SND", 3) == 0))
-				{
-					// ****** sysutil savedata parameter error : 70 ******
-					cellSaveData.error("savedata_op(): fileSet->fileName is set to a system file name (%s)", file_path);
-					savedata_result = {CELL_SAVEDATA_ERROR_PARAM, "70"};
-					break;
-				}
-
-				// Check filename
-				if (sysutil_check_name_string(name, 1, 9) == -1)
-				{
-					cellSaveData.error("savedata_op(): fileSet->fileName is illegal due to file name ('%s')", file_path);
-
-					// ****** sysutil savedata parameter error : 70 ******
-					savedata_result = {CELL_SAVEDATA_ERROR_PARAM, "70"};
-					break;
-				}
-			}
-
-			if (file_path.size() > dotpos + 1)
-			{
-				// Copy file extension
-				std::span dst(name, file_path.size() - dotpos);
-				strcpy_trunc(dst, file_path.operator std::string_view().substr(dotpos + 1));
-
-				// Allow '_' at start even though sysutil_check_name_string does not
-				if (name[0] == '_')
-				{
-					name[0] = '-';
-				}
-
-				// Check file extension
-				if (sysutil_check_name_string(name, 1, 4) == -1)
-				{
-					cellSaveData.error("savedata_op(): fileSet->fileName is illegal due to file extension ('%s')", file_path);
-
-					// ****** sysutil savedata parameter error : 70 ******
-					savedata_result = {CELL_SAVEDATA_ERROR_PARAM, "70"};
-					break;
-				}
 			}
 
 			if (type == CELL_SAVEDATA_FILETYPE_SECUREFILE)
@@ -1786,7 +1799,8 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 		};
 		// clang-format on
 
-		cellSaveData.warning("savedata_op(): Fileop: file=\"%s\", type=%d, op=%d", file_path, fileSet->fileType, fileSet->fileOperation);
+		cellSaveData.warning("savedata_op(): Fileop: file='%s', type=%d, op=%d, bufSize=%d, fileSize=%d, offset=%d",
+			file_path, fileSet->fileType, fileSet->fileOperation, fileSet->fileBufSize, fileSet->fileSize, fileSet->fileOffset);
 
 		if ((file_path == "." || file_path == "..") && fileSet->fileOperation <= CELL_SAVEDATA_FILEOP_WRITE_NOTRUNC)
 		{
@@ -2056,14 +2070,14 @@ static NEVER_INLINE error_code savedata_get_list_item(vm::cptr<char> dirName, vm
 		return CELL_SAVEDATA_ERROR_NODATA;
 	}
 
-	auto psf = psf::load_object(fs::file(sfo));
+	const psf::registry psf = psf::load_object(fs::file(sfo));
 
 	if (sysFileParam)
 	{
-		strcpy_trunc(sysFileParam->listParam, psf.at("SAVEDATA_LIST_PARAM").as_string());
-		strcpy_trunc(sysFileParam->title, psf.at("TITLE").as_string());
-		strcpy_trunc(sysFileParam->subTitle, psf.at("SUB_TITLE").as_string());
-		strcpy_trunc(sysFileParam->detail, psf.at("DETAIL").as_string());
+		strcpy_trunc(sysFileParam->listParam, psf::get_string(psf, "SAVEDATA_LIST_PARAM"));
+		strcpy_trunc(sysFileParam->title, psf::get_string(psf, "TITLE"));
+		strcpy_trunc(sysFileParam->subTitle, psf::get_string(psf, "SUB_TITLE"));
+		strcpy_trunc(sysFileParam->detail, psf::get_string(psf, "DETAIL"));
 	}
 
 	if (dir)
@@ -2087,7 +2101,7 @@ static NEVER_INLINE error_code savedata_get_list_item(vm::cptr<char> dirName, vm
 
 		for (const auto& entry : fs::dir(save_path))
 		{
-			if (entry.is_directory)
+			if (entry.is_directory || check_filename(vfs::unescape(entry.name), false, false))
 			{
 				continue;
 			}
@@ -2095,7 +2109,8 @@ static NEVER_INLINE error_code savedata_get_list_item(vm::cptr<char> dirName, vm
 			size_kbytes += ::narrow<u32>((entry.size + 1023) / 1024); // firmware rounds this value up
 		}
 
-		*sizeKB = size_kbytes;
+		// Add a seemingly constant allocation disk space of PARAM.SFO + PARAM.PFD
+		*sizeKB = size_kbytes + 35;
 	}
 
 	if (bind)

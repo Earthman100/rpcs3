@@ -1,7 +1,6 @@
 #include "display_sleep_control.h"
 
 #ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
 #elif defined(__APPLE__)
@@ -23,7 +22,7 @@ bool display_sleep_control_supported()
 #if defined(_WIN32) || defined(__APPLE__)
 	return true;
 #elif defined(HAVE_QTDBUS)
-	for (const QString& service : { "org.freedesktop.ScreenSaver", "org.mate.ScreenSaver" })
+	for (const char* service : { "org.freedesktop.ScreenSaver", "org.mate.ScreenSaver" })
 	{
 		QDBusInterface interface(service, "/ScreenSaver", service, QDBusConnection::sessionBus());
 		if (interface.isValid())
@@ -55,7 +54,7 @@ void enable_display_sleep()
 #elif defined(HAVE_QTDBUS)
 	if (s_dbus_cookie != 0)
 	{
-		for (const QString& service : { "org.freedesktop.ScreenSaver", "org.mate.ScreenSaver" })
+		for (const char* service : { "org.freedesktop.ScreenSaver", "org.mate.ScreenSaver" })
 		{
 			QDBusInterface interface(service, "/ScreenSaver", service, QDBusConnection::sessionBus());
 			if (interface.isValid())
@@ -81,7 +80,7 @@ void disable_display_sleep()
 #elif defined(__APPLE__)
 	IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep, kIOPMAssertionLevelOn, CFSTR("Game running"), &s_pm_assertion);
 #elif defined(HAVE_QTDBUS)
-	for (const QString& service : { "org.freedesktop.ScreenSaver", "org.mate.ScreenSaver" })
+	for (const char* service : { "org.freedesktop.ScreenSaver", "org.mate.ScreenSaver" })
 	{
 		QDBusInterface interface(service, "/ScreenSaver", service, QDBusConnection::sessionBus());
 		if (interface.isValid())

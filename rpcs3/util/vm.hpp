@@ -3,8 +3,22 @@
 #include "util/types.hpp"
 #include "util/atomic.hpp"
 
+#include <string>
+
 namespace utils
 {
+#ifdef _WIN32
+	using native_handle = void*;
+#else
+	using native_handle = int;
+#endif
+
+	// Obtain system page size
+	long get_page_size();
+
+	// System page size
+	inline const long c_page_size = get_page_size();
+
 	// Memory protection type
 	enum class protection
 	{
@@ -17,9 +31,9 @@ namespace utils
 
 	/**
 	* Reserve `size` bytes of virtual memory and returns it.
-	* The memory should be commited before usage.
+	* The memory should be committed before usage.
 	*/
-	void* memory_reserve(usz size, void* use_addr = nullptr);
+	void* memory_reserve(usz size, void* use_addr = nullptr, bool is_memory_mapping = false);
 
 	/**
 	* Commit `size` bytes of virtual memory starting at pointer.
@@ -42,6 +56,9 @@ namespace utils
 
 	// Lock pages in memory
 	bool memory_lock(void* pointer, usz size);
+
+	// Map file descriptor
+	void* memory_map_fd(native_handle fd, usz size, protection prot);
 
 	// Shared memory handle
 	class shm
@@ -74,7 +91,7 @@ namespace utils
 		u8* try_map(void* ptr, protection prot = protection::rw, bool cow = false) const;
 
 		// Map shared memory over reserved memory region, which is unsafe (non-atomic) under Win32
-		u8* map_critical(void* ptr, protection prot = protection::rw, bool cow = false);
+		std::pair<u8*, std::string> map_critical(void* ptr, protection prot = protection::rw, bool cow = false);
 
 		// Map shared memory into its own storage (not mapped by default)
 		u8* map_self(protection prot = protection::rw);

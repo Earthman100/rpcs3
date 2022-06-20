@@ -161,35 +161,15 @@ namespace rsx
 		u32 resolution_y = 720;    // Y RES
 		atomic_t<u32> state = 0;   // 1 after cellVideoOutConfigure was called
 
-		u32 get_compatible_gcm_format() const
-		{
-			switch (format)
-			{
-			default:
-				rsx_log.error("Invalid AV format 0x%x", format);
-				[[fallthrough]];
-			case 0: // CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_X8R8G8B8:
-			case 1: // CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_X8B8G8R8:
-				return CELL_GCM_TEXTURE_A8R8G8B8;
-			case 2: // CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_R16G16B16X16_FLOAT:
-				return CELL_GCM_TEXTURE_W16_Z16_Y16_X16_FLOAT;
-			}
-		}
+		avconf() noexcept;
+		~avconf() = default;
 
-		u8 get_bpp() const
-		{
-			switch (format)
-			{
-			default:
-				rsx_log.error("Invalid AV format 0x%x", format);
-				[[fallthrough]];
-			case 0: // CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_X8R8G8B8:
-			case 1: // CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_X8B8G8R8:
-				return 4;
-			case 2: // CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_R16G16B16X16_FLOAT:
-				return 8;
-			}
-		}
+		u32 get_compatible_gcm_format() const;
+		u8 get_bpp() const;
+		double get_aspect_ratio() const;
+
+		areau aspect_convert_region(const size2u& image_dimensions, const size2u& output_dimensions) const;
+		size2u aspect_convert_dimensions(const size2u& image_dimensions) const;
 	};
 
 	struct blit_src_info
@@ -200,7 +180,7 @@ namespace rsx
 		u16 offset_y;
 		u16 width;
 		u16 height;
-		u16 pitch;
+		u32 pitch;
 		u32 rsx_address;
 		void *pixels;
 	};
@@ -212,14 +192,14 @@ namespace rsx
 		u16 offset_y;
 		u16 width;
 		u16 height;
-		u16 pitch;
 		u16 clip_x;
 		u16 clip_y;
 		u16 clip_width;
 		u16 clip_height;
 		f32 scale_x;
 		f32 scale_y;
-		u32  rsx_address;
+		u32 pitch;
+		u32 rsx_address;
 		void *pixels;
 		bool swizzled;
 	};
@@ -462,7 +442,7 @@ namespace rsx
 	 * TODO: Variable src/dst and optional se conversion
 	 */
 	template <typename T>
-	void shuffle_texel_data_wzyx(void* data, u16 row_pitch_in_bytes, u16 row_length_in_texels, u16 num_rows)
+	void shuffle_texel_data_wzyx(void* data, u32 row_pitch_in_bytes, u16 row_length_in_texels, u16 num_rows)
 	{
 		char* raw_src = static_cast<char*>(data);
 		T tmp[4];
@@ -669,7 +649,7 @@ namespace rsx
 	}
 
 	template <bool __is_surface = true, typename SurfaceType>
-	inline bool pitch_compatible(const SurfaceType* surface, u16 pitch_required, u16 height_required)
+	inline bool pitch_compatible(const SurfaceType* surface, u32 pitch_required, u16 height_required)
 	{
 		if constexpr (__is_surface)
 		{
@@ -746,11 +726,11 @@ namespace rsx
 	}
 
 	// Convert color write mask for G8B8 to R8G8
-	static inline u32 get_g8b8_r8g8_colormask(u32 mask)
+	static inline u32 get_g8b8_r8g8_clearmask(u32 mask)
 	{
 		u32 result = 0;
-		if (mask & 0x20) result |= 0x20;
-		if (mask & 0x40) result |= 0x10;
+		if (mask & RSX_GCM_CLEAR_GREEN_BIT) result |= RSX_GCM_CLEAR_GREEN_BIT;
+		if (mask & RSX_GCM_CLEAR_BLUE_BIT) result |= RSX_GCM_CLEAR_RED_BIT;
 
 		return result;
 	}
@@ -767,13 +747,13 @@ namespace rsx
 		red = blue;
 	}
 
-	static inline u32 get_abgr8_colormask(u32 mask)
+	static inline u32 get_abgr8_clearmask(u32 mask)
 	{
 		u32 result = 0;
-		if (mask & 0x10) result |= 0x40;
-		if (mask & 0x20) result |= 0x20;
-		if (mask & 0x40) result |= 0x10;
-		if (mask & 0x80) result |= 0x80;
+		if (mask & RSX_GCM_CLEAR_RED_BIT) result |= RSX_GCM_CLEAR_BLUE_BIT;
+		if (mask & RSX_GCM_CLEAR_GREEN_BIT) result |= RSX_GCM_CLEAR_GREEN_BIT;
+		if (mask & RSX_GCM_CLEAR_BLUE_BIT) result |= RSX_GCM_CLEAR_RED_BIT;
+		if (mask & RSX_GCM_CLEAR_ALPHA_BIT) result |= RSX_GCM_CLEAR_ALPHA_BIT;
 		return result;
 	}
 
@@ -783,6 +763,26 @@ namespace rsx
 	}
 
 	static inline void get_abgr8_clear_color(u8& red, u8& /*green*/, u8& blue, u8& /*alpha*/)
+	{
+		std::swap(red, blue);
+	}
+
+	static inline u32 get_b8_clearmask(u32 mask)
+	{
+		u32 result = 0;
+		if (mask & RSX_GCM_CLEAR_BLUE_BIT) result |= RSX_GCM_CLEAR_RED_BIT;
+		return result;
+	}
+
+	static inline void get_b8_colormask(bool& red, bool& green, bool& blue, bool& alpha)
+	{
+		red = blue;
+		green = false;
+		blue = false;
+		alpha = false;
+	}
+
+	static inline void get_b8_clear_color(u8& red, u8& /*green*/, u8& blue, u8& /*alpha*/)
 	{
 		std::swap(red, blue);
 	}

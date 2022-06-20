@@ -177,7 +177,14 @@ void VKGSRender::load_texture_env()
 			{
 				check_heap_status(VK_HEAP_CHECK_TEXTURE_UPLOAD_STORAGE);
 				*sampler_state = m_texture_cache.upload_texture(*m_current_command_buffer, tex, m_rtts);
+			}
+			else
+			{
+				*sampler_state = {};
+			}
 
+			if (sampler_state->validate())
+			{
 				if (sampler_state->is_cyclic_reference)
 				{
 					check_for_cyclic_refs |= true;
@@ -285,13 +292,15 @@ void VKGSRender::load_texture_env()
 
 				if (replace)
 				{
-					fs_sampler_handles[i] = vk::get_resource_manager()->find_sampler(*m_device, wrap_s, wrap_t, wrap_r, false, lod_bias, af_level, min_lod, max_lod,
-						min_filter.filter, mag_filter, min_filter.mipmap_mode, border_color, compare_enabled, depth_compare_mode);
+					fs_sampler_handles[i] = vk::get_resource_manager()->get_sampler(
+						*m_device,
+						fs_sampler_handles[i],
+						wrap_s, wrap_t, wrap_r,
+						false,
+						lod_bias, af_level, min_lod, max_lod,
+						min_filter.filter, mag_filter, min_filter.mipmap_mode,
+						border_color, compare_enabled, depth_compare_mode);
 				}
-			}
-			else
-			{
-				*sampler_state = {};
 			}
 
 			m_textures_dirty[i] = false;
@@ -315,7 +324,14 @@ void VKGSRender::load_texture_env()
 			{
 				check_heap_status(VK_HEAP_CHECK_TEXTURE_UPLOAD_STORAGE);
 				*sampler_state = m_texture_cache.upload_texture(*m_current_command_buffer, tex, m_rtts);
+			}
+			else
+			{
+				*sampler_state = {};
+			}
 
+			if (sampler_state->validate())
+			{
 				if (sampler_state->is_cyclic_reference || sampler_state->external_subresource_desc.do_not_cache)
 				{
 					check_for_cyclic_refs |= true;
@@ -338,16 +354,15 @@ void VKGSRender::load_texture_env()
 
 				if (replace)
 				{
-					vs_sampler_handles[i] = vk::get_resource_manager()->find_sampler(
+					vs_sampler_handles[i] = vk::get_resource_manager()->get_sampler(
 						*m_device,
+						vs_sampler_handles[i],
 						VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_REPEAT,
 						unnormalized_coords,
 						0.f, 1.f, min_lod, max_lod,
 						VK_FILTER_NEAREST, VK_FILTER_NEAREST, VK_SAMPLER_MIPMAP_MODE_NEAREST, border_color);
 				}
 			}
-			else
-				*sampler_state = {};
 
 			m_vertex_textures_dirty[i] = false;
 		}
@@ -363,6 +378,29 @@ void VKGSRender::load_texture_env()
 		{
 			m_current_renderpass_key = key;
 			m_cached_renderpass = VK_NULL_HANDLE;
+		}
+	}
+
+	if (g_cfg.video.vk.asynchronous_texture_streaming)
+	{
+		// We have to do this here, because we have to assume the CB will be dumped
+		auto& async_task_scheduler = g_fxo->get<vk::AsyncTaskScheduler>();
+
+		if (async_task_scheduler.is_recording())
+		{
+			if (async_task_scheduler.is_host_mode())
+			{
+				flush_command_queue();
+				ensure(!async_task_scheduler.is_recording());
+			}
+			else
+			{
+				// Sync any async scheduler tasks
+				if (auto ev = async_task_scheduler.get_primary_sync_label())
+				{
+					ev->gpu_wait(*m_current_command_buffer);
+				}
+			}
 		}
 	}
 }
@@ -719,8 +757,8 @@ void VKGSRender::emit_geometry(u32 sub_index)
 	auto &draw_call = rsx::method_registers.current_draw_clause;
 	m_profiler.start();
 
-	const flags32_t vertex_state_mask = rsx::vertex_base_changed | rsx::vertex_arrays_changed;
-	const flags32_t vertex_state = (sub_index == 0) ? rsx::vertex_arrays_changed : draw_call.execute_pipeline_dependencies() & vertex_state_mask;
+	const rsx::flags32_t vertex_state_mask = rsx::vertex_base_changed | rsx::vertex_arrays_changed;
+	const rsx::flags32_t vertex_state = (sub_index == 0) ? rsx::vertex_arrays_changed : draw_call.execute_pipeline_dependencies() & vertex_state_mask;
 
 	if (vertex_state & rsx::vertex_arrays_changed)
 	{
@@ -771,7 +809,7 @@ void VKGSRender::emit_geometry(u32 sub_index)
 		if (occlusion_id == umax)
 		{
 			// Force flush
-			rsx_log.error("[Performance Warning] Out of free occlusion slots. Forcing hard sync.");
+			rsx_log.warning("[Performance Warning] Out of free occlusion slots. Forcing hard sync.");
 			ZCULL_control::sync(this);
 
 			occlusion_id = m_occlusion_query_manager->allocate_query(*m_current_command_buffer);
@@ -799,7 +837,7 @@ void VKGSRender::emit_geometry(u32 sub_index)
 
 	const auto& binding_table = m_device->get_pipeline_binding_table();
 
-	if (sub_index == 0)
+	if (m_current_draw.subdraw_id == 0)
 	{
 		update_descriptors = true;
 
@@ -822,6 +860,7 @@ void VKGSRender::emit_geometry(u32 sub_index)
 	{
 		// Need to update descriptors; make a copy for the next draw
 		VkDescriptorSet previous_set = m_current_frame->descriptor_set.value();
+		m_current_frame->descriptor_set.flush();
 		m_current_frame->descriptor_set = allocate_descriptor_set();
 		rsx::simple_array<VkCopyDescriptorSet> copy_cmds(binding_table.total_descriptor_bindings);
 
@@ -856,7 +895,7 @@ void VKGSRender::emit_geometry(u32 sub_index)
 		m_program->bind_uniform(m_vertex_layout_storage->value, binding_table.vertex_buffers_first_bind_slot + 2, m_current_frame->descriptor_set);
 	}
 
-	bool reload_state = (!m_current_subdraw_id++);
+	bool reload_state = (!m_current_draw.subdraw_id++);
 	vk::renderpass_op(*m_current_command_buffer, [&](VkCommandBuffer cmd, VkRenderPass pass, VkFramebuffer fbo)
 	{
 		if (get_render_pass() == pass && m_draw_fbo->value == fbo)
@@ -989,7 +1028,11 @@ void VKGSRender::end()
 		m_current_frame->flags &= ~frame_context_state::dirty;
 	}
 
-	analyse_current_rsx_pipeline();
+	if (m_graphics_state & (rsx::pipeline_state::fragment_program_ucode_dirty | rsx::pipeline_state::vertex_program_ucode_dirty))
+	{
+		analyse_current_rsx_pipeline();
+	}
+
 	m_frame_stats.setup_time += m_profiler.duration();
 
 	load_texture_env();
@@ -1012,12 +1055,6 @@ void VKGSRender::end()
 	// Load program execution environment
 	load_program_env();
 	m_frame_stats.setup_time += m_profiler.duration();
-
-	// Sync any async scheduler tasks
-	if (auto ev = g_fxo->get<vk::async_scheduler_thread>().get_primary_sync_label())
-	{
-		ev->gpu_wait(*m_current_command_buffer);
-	}
 
 	for (int binding_attempts = 0; binding_attempts < 3; binding_attempts++)
 	{
@@ -1067,8 +1104,8 @@ void VKGSRender::end()
 	// Final heap check...
 	check_heap_status(VK_HEAP_CHECK_VERTEX_STORAGE | VK_HEAP_CHECK_VERTEX_LAYOUT_STORAGE);
 
-	u32 sub_index = 0;
-	m_current_subdraw_id = 0;
+	u32 sub_index = 0;               // RSX subdraw ID
+	m_current_draw.subdraw_id = 0;   // Host subdraw ID. Invalid RSX subdraws do not increment this value
 
 	rsx::method_registers.current_draw_clause.begin();
 	do
@@ -1083,7 +1120,7 @@ void VKGSRender::end()
 		m_current_command_buffer->flags &= ~(vk::command_buffer::cb_has_conditional_render);
 	}
 
-	m_rtts.on_write(m_framebuffer_layout.color_write_enabled.data(), m_framebuffer_layout.zeta_write_enabled);
+	m_rtts.on_write(m_framebuffer_layout.color_write_enabled, m_framebuffer_layout.zeta_write_enabled);
 
 	rsx::thread::end();
 }

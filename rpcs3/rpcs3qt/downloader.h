@@ -29,14 +29,13 @@ public:
 
 	progress_dialog* get_progress_dialog() const;
 
-	static std::string get_hash(const char* data, usz size, bool lower_case);
-
 private Q_SLOTS:
 	void handle_buffer_update(int size, int max) const;
 
 Q_SIGNALS:
 	void signal_download_error(const QString& error);
 	void signal_download_finished(const QByteArray& data);
+	void signal_download_canceled();
 	void signal_buffer_update(int size, int max);
 
 private:

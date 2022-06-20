@@ -105,6 +105,12 @@ long PadHandlerBase::FindKeyCodeByString(const std::unordered_map<u64, std::stri
 	return -1;
 }
 
+// Get new multiplied value based on the multiplier
+s32 PadHandlerBase::MultipliedInput(s32 raw_value, s32 multiplier)
+{
+	return (multiplier * raw_value) / 100;
+}
+
 // Get new scaled value between 0 and 255 based on its minimum and maximum
 float PadHandlerBase::ScaledInput(s32 raw_value, int minimum, int maximum)
 {
@@ -163,7 +169,7 @@ u16 PadHandlerBase::NormalizeDirectedInput(s32 raw_value, s32 threshold, s32 max
 
 u16 PadHandlerBase::NormalizeStickInput(u16 raw_value, int threshold, int multiplier, bool ignore_threshold) const
 {
-	const s32 scaled_value = (multiplier * raw_value) / 100;
+	const s32 scaled_value = MultipliedInput(raw_value, multiplier);
 
 	if (ignore_threshold)
 	{
@@ -321,8 +327,11 @@ void PadHandlerBase::get_next_button_press(const std::string& pad_id, const pad_
 			fail_callback(pad_id);
 		return;
 	}
-	else if (status == connection::no_data)
+
+	if (status == connection::no_data)
+	{
 		return;
+	}
 
 	// Get the current button values
 	auto data = get_button_values(device);
@@ -331,10 +340,9 @@ void PadHandlerBase::get_next_button_press(const std::string& pad_id, const pad_
 	// Return the new value if the button was pressed (aka. its value was bigger than 0 or the defined threshold)
 	// Use a pair to get all the legally pressed buttons and use the one with highest value (prioritize first)
 	std::pair<u16, std::string> pressed_button = { 0, "" };
-	for (const auto& button : button_list)
+	for (const auto& [keycode, name] : button_list)
 	{
-		const u32 keycode = button.first;
-		const u16 value = data[keycode];
+		const u16& value = data[keycode];
 
 		if (!get_blacklist && std::find(blacklist.begin(), blacklist.end(), keycode) != blacklist.end())
 			continue;
@@ -348,10 +356,10 @@ void PadHandlerBase::get_next_button_press(const std::string& pad_id, const pad_
 			if (get_blacklist)
 			{
 				blacklist.emplace_back(keycode);
-				input_log.error("%s Calibration: Added key [ %d = %s ] to blacklist. Value = %d", m_type, keycode, button.second, value);
+				input_log.error("%s Calibration: Added key [ %d = %s ] to blacklist. Value = %d", m_type, keycode, name, value);
 			}
 			else if (value > pressed_button.first)
-				pressed_button = { value, button.second };
+				pressed_button = { value, name };
 		}
 	}
 
@@ -425,6 +433,11 @@ void PadHandlerBase::TranslateButtonPress(const std::shared_ptr<PadDevice>& devi
 
 bool PadHandlerBase::bindPadToDevice(std::shared_ptr<Pad> pad, const std::string& device, u8 player_id)
 {
+	if (!pad)
+	{
+		return false;
+	}
+
 	std::shared_ptr<PadDevice> pad_device = get_device(device);
 	if (!pad_device)
 	{
@@ -627,8 +640,8 @@ void PadHandlerBase::ThreadProc()
 {
 	for (usz i = 0; i < bindings.size(); ++i)
 	{
-		auto device = bindings[i].first;
-		auto pad    = bindings[i].second;
+		auto& device = bindings[i].first;
+		auto& pad    = bindings[i].second;
 
 		if (!device || !pad)
 			continue;

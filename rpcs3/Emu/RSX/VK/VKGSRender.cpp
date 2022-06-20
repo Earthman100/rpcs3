@@ -32,9 +32,26 @@ namespace vk
 
 		switch (color_format)
 		{
+#ifndef __APPLE__
 		case rsx::surface_color_format::r5g6b5:
 			return std::make_pair(VK_FORMAT_R5G6B5_UNORM_PACK16, vk::default_component_map);
 
+		case rsx::surface_color_format::x1r5g5b5_o1r5g5b5:
+			return std::make_pair(VK_FORMAT_A1R5G5B5_UNORM_PACK16, o_rgb);
+
+		case rsx::surface_color_format::x1r5g5b5_z1r5g5b5:
+			return std::make_pair(VK_FORMAT_A1R5G5B5_UNORM_PACK16, z_rgb);
+#else
+		// assign B8G8R8A8_UNORM to formats that are not supported by Metal
+		case rsx::surface_color_format::r5g6b5:
+			return std::make_pair(VK_FORMAT_B8G8R8A8_UNORM, vk::default_component_map);
+
+		case rsx::surface_color_format::x1r5g5b5_o1r5g5b5:
+			return std::make_pair(VK_FORMAT_B8G8R8A8_UNORM, o_rgb);
+
+		case rsx::surface_color_format::x1r5g5b5_z1r5g5b5:
+			return std::make_pair(VK_FORMAT_B8G8R8A8_UNORM, z_rgb);
+#endif
 		case rsx::surface_color_format::a8r8g8b8:
 			return std::make_pair(VK_FORMAT_B8G8R8A8_UNORM, vk::default_component_map);
 
@@ -58,12 +75,6 @@ namespace vk
 
 		case rsx::surface_color_format::w32z32y32x32:
 			return std::make_pair(VK_FORMAT_R32G32B32A32_SFLOAT, vk::default_component_map);
-
-		case rsx::surface_color_format::x1r5g5b5_o1r5g5b5:
-			return std::make_pair(VK_FORMAT_A1R5G5B5_UNORM_PACK16, o_rgb);
-
-		case rsx::surface_color_format::x1r5g5b5_z1r5g5b5:
-			return std::make_pair(VK_FORMAT_A1R5G5B5_UNORM_PACK16, z_rgb);
 
 		case rsx::surface_color_format::b8:
 		{
@@ -396,19 +407,13 @@ VKGSRender::VKGSRender() : GSRender()
 
 	//create command buffer...
 	m_command_buffer_pool.create((*m_device), m_device->get_graphics_queue_family());
-
-	for (auto &cb : m_primary_cb_list)
-	{
-		cb.create(m_command_buffer_pool);
-		cb.init_fence(*m_device);
-	}
-
-	m_current_command_buffer = &m_primary_cb_list[0];
+	m_primary_cb_list.create(m_command_buffer_pool, vk::command_buffer::access_type_hint::flush_only);
+	m_current_command_buffer = m_primary_cb_list.get();
+	m_current_command_buffer->begin();
 
 	//Create secondary command_buffer for parallel operations
 	m_secondary_command_buffer_pool.create((*m_device), m_device->get_graphics_queue_family());
-	m_secondary_command_buffer.create(m_secondary_command_buffer_pool, true);
-	m_secondary_command_buffer.access_hint = vk::command_buffer::access_type_hint::all;
+	m_secondary_cb_list.create(m_secondary_command_buffer_pool, vk::command_buffer::access_type_hint::all);
 
 	//Precalculated stuff
 	std::tie(pipeline_layout, descriptor_layouts) = get_shared_pipeline_layout(*m_device);
@@ -501,9 +506,7 @@ VKGSRender::VKGSRender() : GSRender()
 	else
 		m_vertex_cache = std::make_unique<vk::weak_vertex_cache>();
 
-	m_shaders_cache = std::make_unique<vk::shader_cache>(*m_prog_buffer, "vulkan", "v1.92");
-
-	open_command_buffer();
+	m_shaders_cache = std::make_unique<vk::shader_cache>(*m_prog_buffer, "vulkan", "v1.93");
 
 	for (u32 i = 0; i < m_swapchain->get_swap_image_count(); ++i)
 	{
@@ -536,7 +539,8 @@ VKGSRender::VKGSRender() : GSRender()
 	// This is here for visual consistency - will be removed when AA problems due to mipmaps are fixed
 	if (g_cfg.video.antialiasing_level != msaa_level::none)
 	{
-		backend_config.supports_hw_a2c = VK_TRUE;
+		backend_config.supports_hw_msaa = true;
+		backend_config.supports_hw_a2c = true;
 		backend_config.supports_hw_a2one = m_device->get_alpha_to_one_support();
 	}
 
@@ -544,14 +548,19 @@ VKGSRender::VKGSRender() : GSRender()
 	// Confirmed in BLES01916 (The Evil Within) which uses RGB565 for some virtual texturing data.
 	backend_config.supports_hw_renormalization = (vk::get_driver_vendor() == vk::driver_vendor::NVIDIA);
 
-	// Relaxed query synchronization
-	backend_config.supports_hw_conditional_render = !!g_cfg.video.relaxed_zcull_sync;
+	// Conditional rendering support
+	backend_config.supports_hw_conditional_render = true;
+
+	// Passthrough DMA
+	backend_config.supports_passthrough_dma = m_device->get_external_memory_host_support();
+
+	// Host sync
+	backend_config.supports_host_gpu_labels = !!g_cfg.video.host_label_synchronization;
 
 	// Async compute and related operations
 	if (g_cfg.video.vk.asynchronous_texture_streaming)
 	{
-		// Optimistic, enable async compute and passthrough DMA
-		backend_config.supports_passthrough_dma = m_device->get_external_memory_host_support();
+		// Optimistic, enable async compute
 		backend_config.supports_asynchronous_compute = true;
 
 		if (m_device->get_graphics_queue() == m_device->get_transfer_queue())
@@ -559,47 +568,87 @@ VKGSRender::VKGSRender() : GSRender()
 			rsx_log.error("Cannot run graphics and async transfer in the same queue. Async uploads are disabled. This is a limitation of your GPU");
 			backend_config.supports_asynchronous_compute = false;
 		}
+	}
 
-		switch (vk::get_driver_vendor())
-		{
-		case vk::driver_vendor::NVIDIA:
-			if (auto chip_family = vk::get_chip_family();
-				chip_family == vk::chip_class::NV_kepler ||
-				chip_family == vk::chip_class::NV_maxwell)
-			{
-				rsx_log.error("Older NVIDIA cards do not meet requirements for asynchronous compute due to some driver fakery.");
-				backend_config.supports_asynchronous_compute = false;
-			}
-			else // Workaround. Remove once the async decoder is re-written
-			{
-				// NVIDIA 471 and newer are completely borked. Queue priority is not observed and any queue waiting on another just causes deadlock.
-				rsx_log.error("NVIDIA GPUs are incompatible with the current implementation of asynchronous texture decoding.");
-				backend_config.supports_asynchronous_compute = false;
-			}
-			break;
-#if !defined(_WIN32)
-			// Anything running on AMDGPU kernel driver will not work due to the check for fd-backed memory allocations
-		case vk::driver_vendor::RADV:
-		case vk::driver_vendor::AMD:
-#if !defined(__linux__)
-			// Intel chipsets would fail on BSD in most cases and DRM_IOCTL_i915_GEM_USERPTR unimplemented
-		case vk::driver_vendor::ANV:
-#endif
-			if (backend_config.supports_passthrough_dma)
-			{
-				rsx_log.error("AMDGPU kernel driver on linux and INTEL driver on some platforms cannot support passthrough DMA buffers.");
-				backend_config.supports_passthrough_dma = false;
-			}
-			break;
-#endif
-		default: break;
-		}
-
+	// Sanity checks
+	switch (vk::get_driver_vendor())
+	{
+	case vk::driver_vendor::NVIDIA:
 		if (backend_config.supports_asynchronous_compute)
 		{
-			// Run only if async compute can be used.
-			g_fxo->init<vk::async_scheduler_thread>("Vulkan Async Scheduler"sv);
+			if (auto chip_family = vk::get_chip_family();
+				chip_family == vk::chip_class::NV_kepler || chip_family == vk::chip_class::NV_maxwell)
+			{
+				rsx_log.warning("Older NVIDIA cards do not meet requirements for true asynchronous compute due to some driver fakery.");
+			}
+
+			rsx_log.notice("Forcing safe async compute for NVIDIA device to avoid crashing.");
+			g_cfg.video.vk.asynchronous_scheduler.set(vk_gpu_scheduler_mode::safe);
 		}
+		break;
+#if !defined(_WIN32)
+		// Anything running on AMDGPU kernel driver will not work due to the check for fd-backed memory allocations
+	case vk::driver_vendor::RADV:
+	case vk::driver_vendor::AMD:
+#if !defined(__linux__)
+		// Intel chipsets would fail on BSD in most cases and DRM_IOCTL_i915_GEM_USERPTR unimplemented
+	case vk::driver_vendor::ANV:
+#endif
+		if (backend_config.supports_passthrough_dma)
+		{
+			rsx_log.error("AMDGPU kernel driver on linux and INTEL driver on some platforms cannot support passthrough DMA buffers.");
+			backend_config.supports_passthrough_dma = false;
+		}
+		break;
+#endif
+	case vk::driver_vendor::MVK:
+		// Async compute crashes immediately on Apple GPUs
+		rsx_log.error("Apple GPUs are incompatible with the current implementation of asynchronous texture decoding.");
+		backend_config.supports_asynchronous_compute = false;
+		break;
+	case vk::driver_vendor::INTEL:
+		// As expected host allocations won't work on INTEL despite the extension being present
+		if (backend_config.supports_passthrough_dma)
+		{
+			rsx_log.error("INTEL driver does not support passthrough DMA buffers");
+			backend_config.supports_passthrough_dma = false;
+		}
+		break;
+	default: break;
+	}
+
+	if (backend_config.supports_asynchronous_compute)
+	{
+		// Run only if async compute can be used.
+		g_fxo->init<vk::AsyncTaskScheduler>(g_cfg.video.vk.asynchronous_scheduler);
+	}
+
+	if (backend_config.supports_host_gpu_labels)
+	{
+		if (backend_config.supports_passthrough_dma)
+		{
+			m_host_object_data = std::make_unique<vk::buffer>(*m_device,
+				0x10000,
+				memory_map.host_visible_coherent, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+				VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0,
+				VMM_ALLOCATION_POOL_SYSTEM);
+
+			m_host_data_ptr = new (m_host_object_data->map(0, 0x100000)) vk::host_data_t();
+			ensure(m_host_data_ptr->magic == 0xCAFEBABE);
+		}
+		else
+		{
+			rsx_log.error("Your GPU/driver does not support extensions required to enable passthrough DMA emulation. Host GPU labels will be disabled.");
+			backend_config.supports_host_gpu_labels = false;
+		}
+	}
+
+	if (!backend_config.supports_host_gpu_labels &&
+		!backend_config.supports_asynchronous_compute)
+	{
+		// Disable passthrough DMA unless we enable a feature that requires it.
+		// I'm avoiding an explicit checkbox for this until I figure out why host labels don't fix all problems with passthrough.
+		backend_config.supports_passthrough_dma = false;
 	}
 }
 
@@ -611,20 +660,30 @@ VKGSRender::~VKGSRender()
 		return;
 	}
 
-	// Globals. TODO: Refactor lifetime management
-	if (backend_config.supports_asynchronous_compute)
+	// Flush DMA queue
+	while (!g_fxo->get<rsx::dma_manager>().sync())
 	{
-		g_fxo->get<vk::async_scheduler_thread>().kill();
+		do_local_task(rsx::FIFO_state::lock_wait);
 	}
 
 	//Wait for device to finish up with resources
 	vkDeviceWaitIdle(*m_device);
 
+	// Globals. TODO: Refactor lifetime management
+	if (backend_config.supports_asynchronous_compute)
+	{
+		g_fxo->get<vk::AsyncTaskScheduler>().destroy();
+	}
+
+	// Host data
+	if (m_host_object_data)
+	{
+		m_host_object_data->unmap();
+		m_host_object_data.reset();
+	}
+
 	// Clear flush requests
 	m_flush_requests.clear_pending_flag();
-
-	// Texture cache
-	m_texture_cache.destroy();
 
 	// Shaders
 	vk::destroy_pipe_compiler();      // Ensure no pending shaders being compiled
@@ -638,9 +697,6 @@ VKGSRender::~VKGSRender()
 
 	// Upscaler (references some global resources)
 	m_upscaler.reset();
-
-	// Global resources
-	vk::destroy_global_resources();
 
 	// Heaps
 	m_attrib_ring_info.destroy();
@@ -698,13 +754,14 @@ VKGSRender::~VKGSRender()
 	m_cond_render_buffer.reset();
 
 	// Command buffer
-	for (auto &cb : m_primary_cb_list)
-		cb.destroy();
+	m_primary_cb_list.destroy();
+	m_secondary_cb_list.destroy();
 
 	m_command_buffer_pool.destroy();
-
-	m_secondary_command_buffer.destroy();
 	m_secondary_command_buffer_pool.destroy();
+
+	// Global resources
+	vk::destroy_global_resources();
 
 	// Device handles/contexts
 	m_swapchain->destroy();
@@ -720,10 +777,8 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 {
 	vk::texture_cache::thrashed_set result;
 	{
-		std::lock_guard lock(m_secondary_cb_guard);
-
 		const rsx::invalidation_cause cause = is_writing ? rsx::invalidation_cause::deferred_write : rsx::invalidation_cause::deferred_read;
-		result = m_texture_cache.invalidate_address(m_secondary_command_buffer, address, cause);
+		result = m_texture_cache.invalidate_address(*m_secondary_cb_list.get(), address, cause);
 	}
 
 	if (result.invalidate_samplers)
@@ -734,7 +789,7 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 
 	if (!result.violation_handled)
 	{
-		return false;
+		return zcull_ctrl->on_access_violation(address);
 	}
 
 	if (result.num_flushable > 0)
@@ -749,6 +804,7 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 
 			g_fxo->get<rsx::dma_manager>().set_mem_fault_flag();
 			m_queue_status |= flush_queue_state::deadlock;
+			m_eng_interrupt_mask |= rsx::backend_interrupt;
 
 			// Wait for deadlock to clear
 			while (m_queue_status & flush_queue_state::deadlock)
@@ -769,6 +825,7 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 			std::lock_guard lock(m_flush_queue_mutex);
 
 			m_flush_requests.post(false);
+			m_eng_interrupt_mask |= rsx::backend_interrupt;
 			has_queue_ref = true;
 		}
 		else
@@ -788,7 +845,7 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 			m_flush_requests.producer_wait();
 		}
 
-		m_texture_cache.flush_all(m_secondary_command_buffer, result);
+		m_texture_cache.flush_all(*m_secondary_cb_list.next(), result);
 
 		if (has_queue_ref)
 		{
@@ -804,7 +861,7 @@ void VKGSRender::on_invalidate_memory_range(const utils::address_range &range, r
 {
 	std::lock_guard lock(m_secondary_cb_guard);
 
-	auto data = m_texture_cache.invalidate_range(m_secondary_command_buffer, range, cause);
+	auto data = m_texture_cache.invalidate_range(*m_secondary_cb_list.next(), range, cause);
 	AUDIT(data.empty());
 
 	if (cause == rsx::invalidation_cause::unmap)
@@ -1031,12 +1088,12 @@ void VKGSRender::check_heap_status(u32 flags)
 			m_texture_upload_buffer_ring_info.reset_allocation_stats();
 			m_raster_env_ring_info.reset_allocation_stats();
 			m_current_frame->reset_heap_ptrs();
-			m_last_heap_sync_time = get_system_time();
+			m_last_heap_sync_time = rsx::get_shared_tag();
 		}
 		else
 		{
 			// Flush the frame context
-			frame_context_cleanup(target_frame, true);
+			frame_context_cleanup(target_frame);
 		}
 
 		m_frame_stats.flip_time += m_profiler.duration();
@@ -1048,15 +1105,12 @@ void VKGSRender::check_present_status()
 	while (!m_queued_frames.empty())
 	{
 		auto ctx = m_queued_frames.front();
-		if (ctx->swap_command_buffer->pending)
+		if (!ctx->swap_command_buffer->poke())
 		{
-			if (!ctx->swap_command_buffer->poke())
-			{
-				return;
-			}
+			return;
 		}
 
-		frame_context_cleanup(ctx, true);
+		frame_context_cleanup(ctx);
 	}
 }
 
@@ -1297,10 +1351,17 @@ void VKGSRender::clear_surface(u32 mask)
 				colormask = 0;
 				break;
 			}
+			case rsx::surface_color_format::b8:
+			{
+				rsx::get_b8_clear_color(clear_r, clear_g, clear_b, clear_a);
+				colormask = rsx::get_b8_clearmask(colormask);
+				use_fast_clear = (colormask == RSX_GCM_CLEAR_RED_BIT);
+				break;
+			}
 			case rsx::surface_color_format::g8b8:
 			{
 				rsx::get_g8b8_clear_color(clear_r, clear_g, clear_b, clear_a);
-				colormask = rsx::get_g8b8_r8g8_colormask(colormask);
+				colormask = rsx::get_g8b8_r8g8_clearmask(colormask);
 				use_fast_clear = (colormask == (RSX_GCM_CLEAR_RED_BIT | RSX_GCM_CLEAR_GREEN_BIT));
 				break;
 			}
@@ -1309,7 +1370,7 @@ void VKGSRender::clear_surface(u32 mask)
 			case rsx::surface_color_format::x8b8g8r8_z8b8g8r8:
 			{
 				rsx::get_abgr8_clear_color(clear_r, clear_g, clear_b, clear_a);
-				colormask = rsx::get_abgr8_colormask(colormask);
+				colormask = rsx::get_abgr8_clearmask(colormask);
 				[[fallthrough]];
 			}
 			default:
@@ -1324,9 +1385,7 @@ void VKGSRender::clear_surface(u32 mask)
 				if (!use_fast_clear || !full_frame)
 				{
 					// If we're not clobber all the memory, a barrier is required
-					for (u8 index = m_rtts.m_bound_render_targets_config.first, count = 0;
-						count < m_rtts.m_bound_render_targets_config.second;
-						++count, ++index)
+					for (const auto& index : m_rtts.m_bound_render_target_ids)
 					{
 						m_rtts.m_bound_render_targets[index].second->write_barrier(*m_current_command_buffer);
 					}
@@ -1391,8 +1450,7 @@ void VKGSRender::clear_surface(u32 mask)
 
 	if (update_color || update_z)
 	{
-		const bool write_all_mask[] = { true, true, true, true };
-		m_rtts.on_write(update_color ? write_all_mask : nullptr, update_z);
+		m_rtts.on_write({ update_color, update_color, update_color, update_color }, update_z);
 	}
 
 	if (!clear_descriptors.empty())
@@ -1404,20 +1462,15 @@ void VKGSRender::clear_surface(u32 mask)
 
 void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
 {
-	close_and_submit_command_buffer(m_current_command_buffer->submit_fence);
+	close_and_submit_command_buffer();
 
 	if (hard_sync)
 	{
 		// wait for the latest instruction to execute
-		m_current_command_buffer->pending = true;
 		m_current_command_buffer->reset();
 
 		// Clear all command buffer statuses
-		for (auto &cb : m_primary_cb_list)
-		{
-			if (cb.pending)
-				cb.poke();
-		}
+		m_primary_cb_list.poke_all();
 
 		// Drain present queue
 		while (!m_queued_frames.empty())
@@ -1427,24 +1480,12 @@ void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
 
 		m_flush_requests.clear_pending_flag();
 	}
-	else
-	{
-		// Mark this queue as pending and proceed
-		m_current_command_buffer->pending = true;
-	}
 
 	if (!do_not_switch)
 	{
 		// Grab next cb in line and make it usable
 		// NOTE: Even in the case of a hard sync, this is required to free any waiters on the CB (ZCULL)
-		m_current_cb_index = (m_current_cb_index + 1) % VK_MAX_ASYNC_CB_COUNT;
-		m_current_command_buffer = &m_primary_cb_list[m_current_cb_index];
-
-		if (!m_current_command_buffer->poke())
-		{
-			rsx_log.error("CB chain has run out of free entries!");
-		}
-
+		m_current_command_buffer = m_primary_cb_list.next();
 		m_current_command_buffer->reset();
 	}
 	else
@@ -1461,26 +1502,87 @@ void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
 		m_current_command_buffer->flags |= vk::command_buffer::cb_load_occluson_task;
 	}
 
-	open_command_buffer();
+	m_current_command_buffer->begin();
 }
 
-void VKGSRender::sync_hint(rsx::FIFO_hint hint, void* args)
+bool VKGSRender::release_GCM_label(u32 address, u32 args)
 {
-	ensure(args);
-	rsx::thread::sync_hint(hint, args);
+	if (!backend_config.supports_host_gpu_labels)
+	{
+		return false;
+	}
 
-	// Occlusion queries not enabled, do nothing
+	auto drain_label_queue = [this]()
+	{
+		while (m_host_data_ptr->last_label_release_event > m_host_data_ptr->commands_complete_event)
+		{
+			utils::pause();
+
+			if (thread_ctrl::state() == thread_state::aborting)
+			{
+				break;
+			}
+		}
+	};
+
+	ensure(m_host_data_ptr);
+	if (m_host_data_ptr->texture_load_complete_event == m_host_data_ptr->texture_load_request_event)
+	{
+		// All texture loads already seen by the host GPU
+		// Wait for all previously submitted labels to be flushed
+		drain_label_queue();
+		return false;
+	}
+
+	const auto mapping = vk::map_dma(address, 4);
+	const auto write_data = std::bit_cast<u32, be_t<u32>>(args);
+
+	if (!dynamic_cast<vk::memory_block_host*>(mapping.second->memory.get()))
+	{
+		// NVIDIA GPUs can disappoint when DMA blocks straddle VirtualAlloc boundaries.
+		// Take the L and try the fallback.
+		rsx_log.warning("Host label update at 0x%x was not possible.", address);
+		drain_label_queue();
+		return false;
+	}
+
+	m_host_data_ptr->last_label_release_event = m_host_data_ptr->inc_counter();
+
+	if (m_host_data_ptr->texture_load_request_event > m_host_data_ptr->last_label_submit_event)
+	{
+		if (vk::is_renderpass_open(*m_current_command_buffer))
+		{
+			vk::end_renderpass(*m_current_command_buffer);
+		}
+
+		vkCmdUpdateBuffer(*m_current_command_buffer, mapping.second->value, mapping.first, 4, &write_data);
+		flush_command_queue();
+	}
+	else
+	{
+		auto cmd = m_secondary_cb_list.next();
+		cmd->begin();
+		vkCmdUpdateBuffer(*cmd, mapping.second->value, mapping.first, 4, &write_data);
+		vkCmdUpdateBuffer(*cmd, m_host_object_data->value, ::offset32(&vk::host_data_t::commands_complete_event), 8, const_cast<u64*>(&m_host_data_ptr->last_label_release_event));
+		cmd->end();
+
+		vk::queue_submit_t submit_info = { m_device->get_graphics_queue(), nullptr };
+		cmd->submit(submit_info);
+
+		m_host_data_ptr->last_label_submit_event = m_host_data_ptr->last_label_release_event;
+	}
+	return true;
+}
+
+void VKGSRender::sync_hint(rsx::FIFO_hint hint, rsx::reports::sync_hint_payload_t payload)
+{
+	rsx::thread::sync_hint(hint, payload);
+
 	if (!(m_current_command_buffer->flags & vk::command_buffer::cb_has_occlusion_task))
+	{
+		// Occlusion queries not enabled, do nothing
 		return;
-
-	// Check if the required report is synced to this CB
-	auto occlusion_info = static_cast<rsx::reports::occlusion_query_info*>(args);
-	auto& data = m_occlusion_map[occlusion_info->driver_handle];
-
-	// NOTE: Currently, a special condition exists where the indices can be empty even with active draw count.
-	// This is caused by async compiler and should be removed when ubershaders are added in
-	if (!data.is_current(m_current_command_buffer) || data.indices.empty())
-		return;
+	}
 
 	// Occlusion test result evaluation is coming up, avoid a hard sync
 	switch (hint)
@@ -1489,15 +1591,44 @@ void VKGSRender::sync_hint(rsx::FIFO_hint hint, void* args)
 	{
 		// If a flush request is already enqueued, do nothing
 		if (m_flush_requests.pending())
+		{
 			return;
+		}
 
-		// Schedule a sync on the next loop iteration
-		m_flush_requests.post(false);
-		m_flush_requests.remove_one();
+		// If the result is not going to be read by CELL, do nothing
+		const auto ref_addr = static_cast<u32>(payload.address);
+		if (!zcull_ctrl->is_query_result_urgent(ref_addr))
+		{
+			// No effect on CELL behaviour, it will be faster to handle this in RSX code
+			return;
+		}
+
+		// OK, cell will be accessing the results, probably.
+		// Try to avoid flush spam, it is more costly to flush the CB than it is to just upload the vertex data
+		// This is supposed to be an optimization afterall.
+		const auto now = rsx::uclock();
+		if ((now - m_last_cond_render_eval_hint) > 50)
+		{
+			// Schedule a sync on the next loop iteration
+			m_flush_requests.post(false);
+			m_flush_requests.remove_one();
+		}
+
+		m_last_cond_render_eval_hint = now;
 		break;
 	}
 	case rsx::FIFO_hint::hint_zcull_sync:
 	{
+		// Check if the required report is synced to this CB
+		auto& data = m_occlusion_map[payload.query->driver_handle];
+
+		// NOTE: Currently, a special condition exists where the indices can be empty even with active draw count.
+		// This is caused by async compiler and should be removed when ubershaders are added in
+		if (!data.is_current(m_current_command_buffer) || data.indices.empty())
+		{
+			return;
+		}
+
 		// Unavoidable hard sync coming up, flush immediately
 		// This heavyweight hint should be used with caution
 		std::lock_guard lock(m_flush_queue_mutex);
@@ -1635,8 +1766,17 @@ bool VKGSRender::load_program()
 		bool color_mask_r = rsx::method_registers.color_mask_r(index);
 		bool color_mask_a = rsx::method_registers.color_mask_a(index);
 
-		if (rsx::method_registers.surface_color() == rsx::surface_color_format::g8b8)
+		switch (rsx::method_registers.surface_color())
+		{
+		case rsx::surface_color_format::b8:
+			rsx::get_b8_colormask(color_mask_r, color_mask_g, color_mask_b, color_mask_a);
+			break;
+		case rsx::surface_color_format::g8b8:
 			rsx::get_g8b8_r8g8_colormask(color_mask_r, color_mask_g, color_mask_b, color_mask_a);
+			break;
+		default:
+			break;
+		}
 
 		properties.state.set_color_mask(index, color_mask_r, color_mask_g, color_mask_b, color_mask_a);
 	}
@@ -1726,14 +1866,10 @@ bool VKGSRender::load_program()
 			rsx::method_registers.msaa_alpha_to_coverage_enabled(),
 			alpha_to_one_enable);
 
-		if (const auto chip_family = vk::get_chip_family();
-			chip_family == vk::chip_class::AMD_navi1x ||
-			chip_family == vk::chip_class::AMD_navi2x)
-		{
-			// NAVI family has a GPU bug with MSAA where shading rate is not correctly initialized if left disabled
-			// Manually initialize it and set it to spec default (full shading)
-			properties.state.set_multisample_shading_rate(1.f);
-		}
+		// A problem observed on multiple GPUs is that interior geometry edges can resolve 0 samples unless we force shading rate of 1.
+		// For whatever reason, the way MSAA images are 'resolved' on PS3 bypasses this issue.
+		// NOTE: We do not do image resolve at all, the output is merely 'exploded' and the guest application is responsible for doing the resolve in software as it is on real hardware.
+		properties.state.set_multisample_shading_rate(1.f);
 	}
 
 	properties.renderpass_key = m_current_renderpass_key;
@@ -1748,13 +1884,15 @@ bool VKGSRender::load_program()
 	}
 
 	const auto shadermode = g_cfg.video.shadermode.get();
+	m_vertex_prog = nullptr;
+	m_fragment_prog = nullptr;
 
 	if (shadermode != shader_mode::interpreter_only) [[likely]]
 	{
 		vk::enter_uninterruptible();
 
 		// Load current program from cache
-		m_program = m_prog_buffer->get_graphics_pipeline(vertex_program, fragment_program, properties,
+		std::tie(m_program, m_vertex_prog, m_fragment_prog) = m_prog_buffer->get_graphics_pipeline(vertex_program, fragment_program, properties,
 			shadermode != shader_mode::recompiler, true, pipeline_layout);
 
 		vk::leave_uninterruptible();
@@ -1837,15 +1975,21 @@ void VKGSRender::load_program_env()
 
 	if (update_transform_constants)
 	{
-		check_heap_status(VK_HEAP_CHECK_TRANSFORM_CONSTANTS_STORAGE);
-
 		// Transform constants
-		auto mem = m_transform_constants_ring_info.alloc<256>(8192);
-		auto buf = m_transform_constants_ring_info.map(mem, 8192);
+		const usz transform_constants_size = (!m_vertex_prog || m_vertex_prog->has_indexed_constants) ? 8192 : m_vertex_prog->constant_ids.size() * 16;
+		if (transform_constants_size)
+		{
+			check_heap_status(VK_HEAP_CHECK_TRANSFORM_CONSTANTS_STORAGE);
 
-		fill_vertex_program_constants_data(buf);
-		m_transform_constants_ring_info.unmap();
-		m_vertex_constants_buffer_info = { m_transform_constants_ring_info.heap->value, mem, 8192 };
+			const auto alignment = m_device->gpu().get_limits().minUniformBufferOffsetAlignment;
+			auto mem = m_transform_constants_ring_info.alloc<1>(utils::align(transform_constants_size, alignment));
+			auto buf = m_transform_constants_ring_info.map(mem, transform_constants_size);
+
+			const std::vector<u16>& constant_ids = (transform_constants_size == 8192) ? std::vector<u16>{} : m_vertex_prog->constant_ids;
+			fill_vertex_program_constants_data(buf, constant_ids);
+			m_transform_constants_ring_info.unmap();
+			m_vertex_constants_buffer_info = { m_transform_constants_ring_info.heap->value, mem, transform_constants_size };
+		}
 	}
 
 	if (update_fragment_constants && !update_instruction_buffers)
@@ -1859,7 +2003,7 @@ void VKGSRender::load_program_env()
 			auto buf = m_fragment_constants_ring_info.map(mem, fragment_constants_size);
 
 			m_prog_buffer->fill_fragment_constants_buffer({ reinterpret_cast<float*>(buf), fragment_constants_size },
-				current_fragment_program, true);
+				*ensure(m_fragment_prog), current_fragment_program, true);
 
 			m_fragment_constants_ring_info.unmap();
 			m_fragment_constants_buffer_info = { m_fragment_constants_ring_info.heap->value, mem, fragment_constants_size };
@@ -1968,7 +2112,7 @@ void VKGSRender::load_program_env()
 
 	if (vk::emulate_conditional_rendering())
 	{
-		auto predicate = m_cond_render_buffer ? m_cond_render_buffer->value : vk::get_scratch_buffer(4)->value;
+		auto predicate = m_cond_render_buffer ? m_cond_render_buffer->value : vk::get_scratch_buffer(*m_current_command_buffer, 4)->value;
 		m_program->bind_buffer({ predicate, 0, 4 }, binding_table.conditional_render_predicate_slot, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, m_current_frame->descriptor_set);
 	}
 
@@ -2036,9 +2180,6 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore 
 	const bool sync_success = g_fxo->get<rsx::dma_manager>().sync();
 	const VkBool32 force_flush = !sync_success;
 
-	// Flush any asynchronously scheduled jobs
-	g_fxo->get<vk::async_scheduler_thread>().flush(force_flush);
-
 	if (vk::test_status_interrupt(vk::heap_dirty))
 	{
 		if (m_attrib_ring_info.is_dirty() ||
@@ -2052,24 +2193,24 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore 
 			m_texture_upload_buffer_ring_info.is_dirty() ||
 			m_raster_env_ring_info.is_dirty())
 		{
-			std::lock_guard lock(m_secondary_cb_guard);
-			m_secondary_command_buffer.begin();
+			auto secondary_command_buffer = m_secondary_cb_list.next();
+			secondary_command_buffer->begin();
 
-			m_attrib_ring_info.sync(m_secondary_command_buffer);
-			m_fragment_env_ring_info.sync(m_secondary_command_buffer);
-			m_vertex_env_ring_info.sync(m_secondary_command_buffer);
-			m_fragment_texture_params_ring_info.sync(m_secondary_command_buffer);
-			m_vertex_layout_ring_info.sync(m_secondary_command_buffer);
-			m_fragment_constants_ring_info.sync(m_secondary_command_buffer);
-			m_index_buffer_ring_info.sync(m_secondary_command_buffer);
-			m_transform_constants_ring_info.sync(m_secondary_command_buffer);
-			m_texture_upload_buffer_ring_info.sync(m_secondary_command_buffer);
-			m_raster_env_ring_info.sync(m_secondary_command_buffer);
+			m_attrib_ring_info.sync(*secondary_command_buffer);
+			m_fragment_env_ring_info.sync(*secondary_command_buffer);
+			m_vertex_env_ring_info.sync(*secondary_command_buffer);
+			m_fragment_texture_params_ring_info.sync(*secondary_command_buffer);
+			m_vertex_layout_ring_info.sync(*secondary_command_buffer);
+			m_fragment_constants_ring_info.sync(*secondary_command_buffer);
+			m_index_buffer_ring_info.sync(*secondary_command_buffer);
+			m_transform_constants_ring_info.sync(*secondary_command_buffer);
+			m_texture_upload_buffer_ring_info.sync(*secondary_command_buffer);
+			m_raster_env_ring_info.sync(*secondary_command_buffer);
 
-			m_secondary_command_buffer.end();
+			secondary_command_buffer->end();
 
-			m_secondary_command_buffer.submit(m_device->get_graphics_queue(),
-				VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, force_flush);
+			vk::queue_submit_t submit_info{ m_device->get_graphics_queue(), nullptr };
+			secondary_command_buffer->submit(submit_info, force_flush);
 		}
 
 		vk::clear_status_interrupt(vk::heap_dirty);
@@ -2097,23 +2238,70 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore 
 		m_current_command_buffer->flags &= ~vk::command_buffer::cb_has_open_query;
 	}
 
+	if (m_host_data_ptr && m_host_data_ptr->last_label_release_event > m_host_data_ptr->last_label_submit_event)
+	{
+		vkCmdUpdateBuffer(*m_current_command_buffer,
+			m_host_object_data->value,
+			::offset32(&vk::host_data_t::commands_complete_event),
+			sizeof(u64),
+			const_cast<u64*>(&m_host_data_ptr->last_label_release_event));
+
+		m_host_data_ptr->last_label_submit_event = m_host_data_ptr->last_label_release_event;
+	}
+
 	m_current_command_buffer->end();
 	m_current_command_buffer->tag();
 
-	m_current_command_buffer->submit(m_device->get_graphics_queue(),
-		wait_semaphore, signal_semaphore, pFence, pipeline_stage_flags, force_flush);
+	// Flush any asynchronously scheduled jobs
+	// So this is a bit trippy, but, in this case, the primary CB contains the 'release' operations, not the acquire ones.
+	// The CB that comes in after this submit will acquire the yielded resources automatically.
+	// This means the primary CB is the precursor to the async CB not the other way around.
+	// Async CB should wait for the primary CB to signal.
+	vk::queue_submit_t primary_submit_info{ m_device->get_graphics_queue(), pFence };
+	vk::queue_submit_t secondary_submit_info{};
 
-	if (force_flush)
+	if (wait_semaphore)
 	{
-		ensure(m_current_command_buffer->submit_fence->flushed);
+		primary_submit_info.wait_on(wait_semaphore, pipeline_stage_flags);
+	}
+
+	if (const auto wait_sema = std::exchange(m_dangling_semaphore_signal, nullptr))
+	{
+		// TODO: Sync on VS stage
+		primary_submit_info.wait_on(wait_sema, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	}
+
+	auto& async_scheduler = g_fxo->get<vk::AsyncTaskScheduler>();
+	const bool require_secondary_flush = async_scheduler.is_recording();
+
+	if (async_scheduler.is_recording())
+	{
+		if (async_scheduler.is_host_mode())
+		{
+			// Inject dependency chain using semaphores.
+			// HEAD = externally synchronized.
+			// TAIL = insert dangling wait, from the async CB to the next CB down.
+			m_dangling_semaphore_signal = *async_scheduler.get_sema();
+			secondary_submit_info.queue_signal(m_dangling_semaphore_signal);
+
+			// Delay object destruction by one cycle
+			vk::get_resource_manager()->push_down_current_scope();
+		}
+	}
+
+	if (signal_semaphore)
+	{
+		primary_submit_info.queue_signal(signal_semaphore);
+	}
+
+	m_current_command_buffer->submit(primary_submit_info, force_flush);
+
+	if (require_secondary_flush)
+	{
+		async_scheduler.flush(secondary_submit_info, force_flush);
 	}
 
 	m_queue_status.clear(flush_queue_state::flushing);
-}
-
-void VKGSRender::open_command_buffer()
-{
-	m_current_command_buffer->begin();
 }
 
 void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
@@ -2305,7 +2493,7 @@ void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 
 			m_texture_cache.lock_memory_region(
 				*m_current_command_buffer, surface, surface->get_memory_range(), false,
-				surface->get_surface_width(rsx::surface_metrics::pixels), surface->get_surface_height(rsx::surface_metrics::pixels), surface->get_rsx_pitch(),
+				surface->get_surface_width<rsx::surface_metrics::pixels>(), surface->get_surface_height<rsx::surface_metrics::pixels>(), surface->get_rsx_pitch(),
 				gcm_format, swap_bytes);
 		}
 
@@ -2339,7 +2527,7 @@ void VKGSRender::renderctl(u32 request_code, void* args)
 	{
 	case vk::rctrl_queue_submit:
 	{
-		const auto packet = reinterpret_cast<vk::submit_packet*>(args);
+		const auto packet = reinterpret_cast<vk::queue_submit_t*>(args);
 		vk::queue_submit(packet);
 		free(packet);
 		break;
@@ -2445,7 +2633,7 @@ void VKGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info* 
 				m_flush_requests.clear_pending_flag();
 			}
 
-			rsx_log.error("[Performance warning] Unexpected ZCULL read caused a hard sync");
+			rsx_log.warning("[Performance warning] Unexpected ZCULL read caused a hard sync");
 			busy_wait();
 		}
 
@@ -2540,6 +2728,18 @@ void VKGSRender::begin_conditional_rendering(const std::vector<rsx::reports::occ
 
 	VkPipelineStageFlags dst_stage;
 	VkAccessFlags dst_access;
+	u32 dst_offset = 0;
+	u32 num_hw_queries = 0;
+	usz first = 0;
+	usz last = (!partial_eval) ? sources.size() : 1;
+
+	// Count number of queries available. This is an "opening" evaluation, if there is only one source, read it as-is.
+	// The idea is to avoid scheduling a compute task unless we have to.
+	for (usz i = first; i < last; ++i)
+	{
+		auto& query_info = m_occlusion_map[sources[i]->driver_handle];
+		num_hw_queries += ::size32(query_info.indices);
+	}
 
 	if (m_device->get_conditional_render_support())
 	{
@@ -2552,56 +2752,51 @@ void VKGSRender::begin_conditional_rendering(const std::vector<rsx::reports::occ
 		dst_access = VK_ACCESS_SHADER_READ_BIT;
 	}
 
-	if (sources.size() == 1)
+	if (num_hw_queries == 1 && !partial_eval) [[ likely ]]
 	{
-		const auto query = sources.front();
-		const auto& query_info = m_occlusion_map[query->driver_handle];
-
-		if (query_info.indices.size() == 1)
+		// Accept the first available query handle as the source of truth. No aggregation is required.
+		for (usz i = first; i < last; ++i)
 		{
-			const auto& index = query_info.indices.front();
-			m_occlusion_query_manager->get_query_result_indirect(*m_current_command_buffer, index, m_cond_render_buffer->value, 0);
+			auto& query_info = m_occlusion_map[sources[i]->driver_handle];
+			if (!query_info.indices.empty())
+			{
+				const auto& index = query_info.indices.front();
+				m_occlusion_query_manager->get_query_result_indirect(*m_current_command_buffer, index, m_cond_render_buffer->value, 0);
 
-			vk::insert_buffer_memory_barrier(*m_current_command_buffer, m_cond_render_buffer->value, 0, 4,
-				VK_PIPELINE_STAGE_TRANSFER_BIT, dst_stage,
-				VK_ACCESS_TRANSFER_WRITE_BIT, dst_access);
+				vk::insert_buffer_memory_barrier(*m_current_command_buffer, m_cond_render_buffer->value, 0, 4,
+					VK_PIPELINE_STAGE_TRANSFER_BIT, dst_stage,
+					VK_ACCESS_TRANSFER_WRITE_BIT, dst_access);
 
-			rsx::thread::begin_conditional_rendering(sources);
-			return;
+				rsx::thread::begin_conditional_rendering(sources);
+				return;
+			}
 		}
-	}
 
-	auto scratch = vk::get_scratch_buffer(OCCLUSION_MAX_POOL_SIZE * 4);
-	u32 dst_offset = 0;
-	usz first = 0;
-	usz last;
-
-	if (!partial_eval) [[likely]]
-	{
-		last = sources.size();
+		// This is unreachable unless something went horribly wrong
+		fmt::throw_exception("Unreachable");
 	}
-	else
+	else if (num_hw_queries > 0)
 	{
-		last = 1;
-	}
-
-	for (usz i = first; i < last; ++i)
-	{
-		auto& query_info = m_occlusion_map[sources[i]->driver_handle];
-		for (const auto& index : query_info.indices)
+		// We'll need to do some result aggregation using a compute shader.
+		auto scratch = vk::get_scratch_buffer(*m_current_command_buffer, num_hw_queries * 4);
+		for (usz i = first; i < last; ++i)
 		{
-			m_occlusion_query_manager->get_query_result_indirect(*m_current_command_buffer, index, scratch->value, dst_offset);
-			dst_offset += 4;
+			auto& query_info = m_occlusion_map[sources[i]->driver_handle];
+			for (const auto& index : query_info.indices)
+			{
+				m_occlusion_query_manager->get_query_result_indirect(*m_current_command_buffer, index, scratch->value, dst_offset);
+				dst_offset += 4;
+			}
 		}
-	}
 
-	if (dst_offset)
-	{
-		// Fast path should have been caught above
-		ensure(dst_offset > 4);
+		// Sanity check
+		ensure(dst_offset <= scratch->size());
 
 		if (!partial_eval)
 		{
+			// Fast path should have been caught above
+			ensure(dst_offset > 4);
+
 			// Clear result to zero
 			vkCmdFillBuffer(*m_current_command_buffer, m_cond_render_buffer->value, 0, 4, 0);
 

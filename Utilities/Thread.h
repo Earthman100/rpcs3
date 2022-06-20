@@ -276,8 +276,8 @@ public:
 	}
 
 	// Wait for both thread sync var and provided atomic var
-	template <atomic_wait::op Op = atomic_wait::op::eq, typename T, typename U>
-	static inline void wait_on(T& wait, U old, u64 usec = -1)
+	template <uint Max, typename Func>
+	static inline void wait_on_custom(Func&& setter, u64 usec = -1)
 	{
 		auto _this = g_tls_this_thread;
 
@@ -286,11 +286,17 @@ public:
 			return;
 		}
 
-		atomic_wait::list<3> list{};
-		list.set<0, Op>(wait, old);
-		list.set<1>(_this->m_sync, 0, 4 + 1);
-		list.set<2>(_this->m_taskq, nullptr);
+		atomic_wait::list<Max + 2> list{};
+		list.template set<Max>(_this->m_sync, 0, 4 + 1);
+		list.template set<Max + 1>(_this->m_taskq, nullptr);
+		setter(list);
 		list.wait(atomic_wait_timeout{usec <= 0xffff'ffff'ffff'ffff / 1000 ? usec * 1000 : 0xffff'ffff'ffff'ffff});
+	}
+
+	template <atomic_wait::op Op = atomic_wait::op::eq, typename T, typename U>
+	static inline void wait_on(T& wait, U old, u64 usec = -1)
+	{
+		wait_on_custom<1>([&](atomic_wait::list<3>& list){ list.set<0, Op>(wait, old); }, usec);
 	}
 
 	// Exit.
@@ -478,7 +484,19 @@ class named_thread final : public Context, result_storage<Context>, thread_base
 		return thread::finalize(thread_state::finished);
 	}
 
+#if defined(ARCH_X64)
 	static inline thread::native_entry trampoline = thread::make_trampoline(entry_point);
+#else
+	static void* trampoline(void* arg)
+	{
+		if (const auto next = thread_base::finalize(entry_point(static_cast<thread_base*>(arg))))
+		{
+			return next(thread_ctrl::get_current());
+		}
+
+		return nullptr;
+	}
+#endif
 
 	friend class thread_ctrl;
 

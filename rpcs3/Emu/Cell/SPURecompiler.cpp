@@ -24,19 +24,25 @@
 #include <unordered_set>
 
 #include "util/v128.hpp"
-#include "util/v128sse.hpp"
+#include "util/simd.hpp"
 #include "util/sysinfo.hpp"
 
-const spu_decoder<spu_itype> s_spu_itype;
-const spu_decoder<spu_iname> s_spu_iname;
-const spu_decoder<spu_iflag> s_spu_iflag;
-
-extern const spu_decoder<spu_interpreter_precise> g_spu_interpreter_precise{};
-extern const spu_decoder<spu_interpreter_fast> g_spu_interpreter_fast;
+const extern spu_decoder<spu_itype> g_spu_itype;
+const extern spu_decoder<spu_iname> g_spu_iname;
+const extern spu_decoder<spu_iflag> g_spu_iflag;
 
 // Move 4 args for calling native function from a GHC calling convention function
 static u8* move_args_ghc_to_native(u8* raw)
 {
+#ifdef ARCH_ARM64
+	// Note: this is a placeholder to get rpcs3 working for now
+	// mov x0, x22
+	// mov x1, x23
+	// mov x2, x24
+	// mov x3, x25
+	std::memcpy(raw, "\xE0\x03\x16\xAA\xE1\x03\x17\xAA\xE2\x03\x18\xAA\xE3\x03\x19\xAA", 16);
+	return raw + 16;
+#else
 #ifdef _WIN32
 	// mov  rcx, r13
 	// mov  rdx, rbp
@@ -52,10 +58,14 @@ static u8* move_args_ghc_to_native(u8* raw)
 #endif
 
 	return raw + 12;
+#endif
 }
 
 DECLARE(spu_runtime::tr_dispatch) = []
 {
+#ifdef __APPLE__
+	pthread_jit_write_protect_np(false);
+#endif
 	// Generate a special trampoline to spu_recompiler_base::dispatch with pause instruction
 	u8* const trptr = jit_runtime::alloc(32, 16);
 	u8* raw = move_args_ghc_to_native(trptr);
@@ -160,11 +170,12 @@ DECLARE(spu_runtime::tr_all) = []
 	return reinterpret_cast<spu_function_t>(trptr);
 }();
 
-DECLARE(spu_runtime::g_gateway) = build_function_asm<spu_function_t>([](asmjit::X86Assembler& c, auto& args)
+DECLARE(spu_runtime::g_gateway) = build_function_asm<spu_function_t>("spu_gateway", [](native_asm& c, auto& args)
 {
 	// Gateway for SPU dispatcher, converts from native to GHC calling convention, also saves RSP value for spu_escape
 	using namespace asmjit;
 
+#if defined(ARCH_X64)
 #ifdef _WIN32
 	c.push(x86::r15);
 	c.push(x86::r14);
@@ -209,7 +220,7 @@ DECLARE(spu_runtime::g_gateway) = build_function_asm<spu_function_t>([](asmjit::
 		c.vzeroupper();
 	}
 
-	c.call(asmjit::imm_ptr(spu_runtime::tr_all));
+	c.call(spu_runtime::tr_all);
 
 	if (utils::has_avx())
 	{
@@ -247,35 +258,44 @@ DECLARE(spu_runtime::g_gateway) = build_function_asm<spu_function_t>([](asmjit::
 #endif
 
 	c.ret();
+#else
+	c.ret(a64::x30);
+#endif
 });
 
-DECLARE(spu_runtime::g_escape) = build_function_asm<void(*)(spu_thread*)>([](asmjit::X86Assembler& c, auto& args)
+DECLARE(spu_runtime::g_escape) = build_function_asm<void(*)(spu_thread*)>("spu_escape", [](native_asm& c, auto& args)
 {
 	using namespace asmjit;
 
+#if defined(ARCH_X64)
 	// Restore native stack pointer (longjmp emulation)
 	c.mov(x86::rsp, x86::qword_ptr(args[0], ::offset32(&spu_thread::saved_native_sp)));
 
 	// Return to the return location
-	c.jmp(x86::qword_ptr(x86::rsp, -8));
+	c.sub(x86::rsp, 8);
+	c.ret();
+#endif
 });
 
-DECLARE(spu_runtime::g_tail_escape) = build_function_asm<void(*)(spu_thread*, spu_function_t, u8*)>([](asmjit::X86Assembler& c, auto& args)
+DECLARE(spu_runtime::g_tail_escape) = build_function_asm<void(*)(spu_thread*, spu_function_t, u8*)>("spu_tail_escape", [](native_asm& c, auto& args)
 {
 	using namespace asmjit;
 
+#if defined(ARCH_X64)
 	// Restore native stack pointer (longjmp emulation)
 	c.mov(x86::rsp, x86::qword_ptr(args[0], ::offset32(&spu_thread::saved_native_sp)));
 
 	// Adjust stack for initial call instruction in the gateway
-	c.sub(x86::rsp, 8);
+	c.sub(x86::rsp, 16);
 
 	// Tail call, GHC CC (second arg)
 	c.mov(x86::r13, args[0]);
 	c.mov(x86::rbp, x86::qword_ptr(args[0], ::offset32(&spu_thread::ls)));
 	c.mov(x86::r12, args[2]);
 	c.xor_(x86::ebx, x86::ebx);
-	c.jmp(args[1]);
+	c.mov(x86::qword_ptr(x86::rsp), args[1]);
+	c.ret();
+#endif
 });
 
 DECLARE(spu_runtime::g_interpreter_table) = {};
@@ -362,7 +382,7 @@ void spu_cache::initialize()
 {
 	spu_runtime::g_interpreter = spu_runtime::g_gateway;
 
-	if (g_cfg.core.spu_decoder == spu_decoder_type::precise || g_cfg.core.spu_decoder == spu_decoder_type::fast)
+	if (g_cfg.core.spu_decoder == spu_decoder_type::_static || g_cfg.core.spu_decoder == spu_decoder_type::dynamic)
 	{
 		for (auto& x : *spu_runtime::g_dispatcher)
 		{
@@ -393,7 +413,7 @@ void spu_cache::initialize()
 	atomic_t<usz> fnext{};
 	atomic_t<u8> fail_flag{0};
 
-	if (g_cfg.core.spu_decoder == spu_decoder_type::fast || g_cfg.core.spu_decoder == spu_decoder_type::llvm)
+	if (g_cfg.core.spu_decoder == spu_decoder_type::dynamic || g_cfg.core.spu_decoder == spu_decoder_type::llvm)
 	{
 		if (auto compiler = spu_recompiler_base::make_llvm_recompiler(11))
 		{
@@ -432,6 +452,9 @@ void spu_cache::initialize()
 
 	named_thread_group workers("SPU Worker ", worker_count, [&]() -> uint
 	{
+#ifdef __APPLE__
+		pthread_jit_write_protect_np(false);
+#endif
 		// Set low priority
 		thread_ctrl::scoped_priority low_prio(-1);
 
@@ -632,7 +655,7 @@ void spu_cache::initialize()
 
 				for (u32 i = 0; i < f->data.size(); i++)
 				{
-					fmt::append(dump, "%-10s", s_spu_iname.decode(std::bit_cast<be_t<u32>>(f->data[i])));
+					fmt::append(dump, "%-10s", g_spu_iname.decode(std::bit_cast<be_t<u32>>(f->data[i])));
 				}
 
 				n_max = std::max(n_max, ::size32(depth_n));
@@ -1066,6 +1089,10 @@ spu_function_t spu_runtime::rebuild_ubertrampoline(u32 id_inst)
 
 		workload.clear();
 		result = reinterpret_cast<spu_function_t>(reinterpret_cast<u64>(wxptr));
+
+		std::string fname;
+		fmt::append(fname, "__ub%u", m_flat_list.size());
+		jit_announce(wxptr, raw - wxptr, fname);
 	}
 
 	if (auto _old = stuff_it->trampoline.compare_and_swap(nullptr, result))
@@ -1285,15 +1312,13 @@ void spu_recompiler_base::branch(spu_thread& spu, void*, u8* rip)
 
 void spu_recompiler_base::old_interpreter(spu_thread& spu, void* ls, u8* /*rip*/)
 {
-	if (g_cfg.core.spu_decoder > spu_decoder_type::fast)
+	if (g_cfg.core.spu_decoder != spu_decoder_type::_static)
 	{
 		fmt::throw_exception("Invalid SPU decoder");
 	}
 
 	// Select opcode table
-	const auto& table = *(g_cfg.core.spu_decoder == spu_decoder_type::precise
-		? &g_spu_interpreter_precise.get_table()
-		: &g_spu_interpreter_fast.get_table());
+	const auto& table = g_fxo->get<spu_interpreter_rt>();
 
 	// LS pointer
 	const auto base = static_cast<const u8*>(ls);
@@ -1307,7 +1332,7 @@ void spu_recompiler_base::old_interpreter(spu_thread& spu, void* ls, u8* /*rip*/
 		}
 
 		const u32 op = *reinterpret_cast<const be_t<u32>*>(base + spu.pc);
-		if (table[spu_decode(op)](spu, {op}))
+		if (table.decode(op)(spu, {op}))
 			spu.pc += 4;
 	}
 }
@@ -1426,7 +1451,7 @@ spu_program spu_recompiler_base::analyse(const be_t<u32>* ls, u32 entry_point)
 		m_targets.erase(pos);
 
 		// Fill register access info
-		if (auto iflags = s_spu_iflag.decode(data))
+		if (auto iflags = g_spu_iflag.decode(data))
 		{
 			if (+iflags & +spu_iflag::use_ra)
 				m_use_ra[pos / 4] = op.ra;
@@ -1437,7 +1462,7 @@ spu_program spu_recompiler_base::analyse(const be_t<u32>* ls, u32 entry_point)
 		}
 
 		// Analyse instruction
-		switch (const auto type = s_spu_itype.decode(data))
+		switch (const auto type = g_spu_itype.decode(data))
 		{
 		case spu_itype::UNK:
 		case spu_itype::DFCEQ:
@@ -2293,7 +2318,7 @@ spu_program spu_recompiler_base::analyse(const be_t<u32>* ls, u32 entry_point)
 			// Decode instruction
 			const spu_opcode_t op{std::bit_cast<be_t<u32>>(result.data[(ia - lsa) / 4])};
 
-			const auto type = s_spu_itype.decode(op.opcode);
+			const auto type = g_spu_itype.decode(op.opcode);
 
 			u8 reg_save = 255;
 
@@ -2786,7 +2811,7 @@ spu_program spu_recompiler_base::analyse(const be_t<u32>* ls, u32 entry_point)
 		{
 			// Decode instruction again
 			op.opcode = std::bit_cast<be_t<u32>>(result.data[(ia - lsa) / 41]);
-			last_inst = s_spu_itype.decode(op.opcode);
+			last_inst = g_spu_itype.decode(op.opcode);
 
 			// Propagate some constants
 			switch (last_inst)
@@ -3480,7 +3505,7 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 #endif
 
 		// Get function chunk name
-		const std::string name = fmt::format("spu-chunk-0x%05x", addr);
+		const std::string name = fmt::format("__spu-cx%05x-%s", addr, fmt::base57(be_t<u64>{m_hash_start}));
 		llvm::Function* result = llvm::cast<llvm::Function>(m_module->getOrInsertFunction(name, chunk_type).getCallee());
 
 		// Set parameters
@@ -3505,7 +3530,7 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 				// 5. $3
 				const auto func_type = get_ftype<u32[4], u8*, u8*, u32, u32[4], u32[4]>();
 
-				const std::string fname = fmt::format("spu-function-0x%05x", addr);
+				const std::string fname = fmt::format("__spu-fx%05x-%s", addr, fmt::base57(be_t<u64>{m_hash_start}));
 				llvm::Function* fn = llvm::cast<llvm::Function>(m_module->getOrInsertFunction(fname, func_type).getCallee());
 
 				fn->setLinkage(llvm::GlobalValue::InternalLinkage);
@@ -4374,7 +4399,7 @@ public:
 			sha1_finish(&ctx, output);
 
 			m_hash.clear();
-			fmt::append(m_hash, "spu-0x%05x-%s", func.entry_point, fmt::base57(output));
+			fmt::append(m_hash, "__spu-0x%05x-%s", func.entry_point, fmt::base57(output));
 
 			be_t<u64> hash_start;
 			std::memcpy(&hash_start, output, sizeof(hash_start));
@@ -4403,7 +4428,7 @@ public:
 
 		// Create LLVM module
 		std::unique_ptr<Module> _module = std::make_unique<Module>(m_hash + ".obj", m_context);
-		_module->setTargetTriple(Triple::normalize("x86_64-unknown-linux-gnu"));
+		_module->setTargetTriple(Triple::normalize(utils::c_llvm_default_triple));
 		_module->setDataLayout(m_jit.get_engine().getTargetMachine()->createDataLayout());
 		m_module = _module.get();
 
@@ -4642,7 +4667,7 @@ public:
 			m_ir->CreateUnreachable();
 		}
 
-		m_dispatch = cast<Function>(_module->getOrInsertFunction("spu-null", entry_chunk->chunk->getFunctionType()).getCallee());
+		m_dispatch = cast<Function>(_module->getOrInsertFunction("__spu-null", entry_chunk->chunk->getFunctionType()).getCallee());
 		m_dispatch->setLinkage(llvm::GlobalValue::InternalLinkage);
 		m_dispatch->setCallingConv(entry_chunk->chunk->getCallingConv());
 		set_function(m_dispatch);
@@ -4663,7 +4688,12 @@ public:
 		// Function that executes check_state and escapes if necessary
 		m_test_state = llvm::cast<llvm::Function>(m_module->getOrInsertFunction("spu_test_state", get_ftype<void, u8*>()).getCallee());
 		m_test_state->setLinkage(GlobalValue::InternalLinkage);
+#ifdef ARCH_ARM64
+		// LLVM doesn't support PreserveAll on arm64.
+		m_test_state->setCallingConv(CallingConv::GHC);
+#else
 		m_test_state->setCallingConv(CallingConv::PreserveAll);
+#endif
 		m_ir->SetInsertPoint(BasicBlock::Create(m_context, "", m_test_state));
 		const auto escape_yes = BasicBlock::Create(m_context, "", m_test_state);
 		const auto escape_no = BasicBlock::Create(m_context, "", m_test_state);
@@ -5031,7 +5061,7 @@ public:
 
 			// Execute interpreter instruction
 			const u32 op = *reinterpret_cast<const be_t<u32>*>(_spu->_ptr<u8>(0) + _spu->pc);
-			if (!g_spu_interpreter_fast.decode(op)(*_spu, {op}))
+			if (!g_fxo->get<spu_interpreter_rt>().decode(op)(*_spu, {op}))
 				spu_log.fatal("Bad instruction");
 
 			// Swap state
@@ -5060,7 +5090,7 @@ public:
 
 		// Create LLVM module
 		std::unique_ptr<Module> _module = std::make_unique<Module>("spu_interpreter.obj", m_context);
-		_module->setTargetTriple(Triple::normalize("x86_64-unknown-linux-gnu"));
+		_module->setTargetTriple(Triple::normalize(utils::c_llvm_default_triple));
 		_module->setDataLayout(m_jit.get_engine().getTargetMachine()->createDataLayout());
 		m_module = _module.get();
 
@@ -5105,7 +5135,11 @@ public:
 
 		// Save host thread's stack pointer
 		const auto native_sp = spu_ptr<u64>(&spu_thread::saved_native_sp);
+#if defined(ARCH_X64)
 		const auto rsp_name = MetadataAsValue::get(m_context, MDNode::get(m_context, {MDString::get(m_context, "rsp")}));
+#elif defined(ARCH_ARM64)
+		const auto rsp_name = MetadataAsValue::get(m_context, MDNode::get(m_context, {MDString::get(m_context, "sp")}));
+#endif
 		m_ir->CreateStore(m_ir->CreateCall(get_intrinsic<u64>(Intrinsic::read_register), {rsp_name}), native_sp);
 
 		// Decode (shift) and load function pointer
@@ -5147,10 +5181,10 @@ public:
 			const u32 op = i << (32u - m_interp_magn);
 
 			// Instruction type
-			const auto itype = s_spu_itype.decode(op);
+			const auto itype = g_spu_itype.decode(op);
 
 			// Function name
-			std::string fname = fmt::format("spu_%s", s_spu_iname.decode(op));
+			std::string fname = fmt::format("spu_%s", g_spu_iname.decode(op));
 
 			if (last_itype != itype)
 			{
@@ -5319,7 +5353,11 @@ public:
 							else if (!(itype & spu_itype::branch))
 							{
 								// Hack: inline ret instruction before final jmp; this is not reliable.
+#ifdef ARCH_X64
 								m_ir->CreateCall(InlineAsm::get(get_ftype<void>(), "ret", "", true, false, InlineAsm::AD_Intel));
+#else
+								m_ir->CreateCall(InlineAsm::get(get_ftype<void>(), "ret", "", true, false));
+#endif
 								fret = ret_func;
 							}
 
@@ -5456,7 +5494,7 @@ public:
 		return _spu->check_state();
 	}
 
-	template <spu_inter_func_t F>
+	template <spu_intrp_func_t F>
 	static void exec_fall(spu_thread* _spu, spu_opcode_t op)
 	{
 		if (F(*_spu, op))
@@ -5465,10 +5503,10 @@ public:
 		}
 	}
 
-	template <spu_inter_func_t F>
+	template <spu_intrp_func_t F>
 	void fall(spu_opcode_t op)
 	{
-		std::string name = fmt::format("spu_%s", s_spu_iname.decode(op.opcode));
+		std::string name = fmt::format("spu_%s", g_spu_iname.decode(op.opcode));
 
 		if (m_interp_magn)
 		{
@@ -5570,7 +5608,7 @@ public:
 
 	static u32 exec_read_dec(spu_thread* _spu)
 	{
-		const u32 res = _spu->ch_dec_value - static_cast<u32>(get_timebased_time() - _spu->ch_dec_start_timestamp);
+		const u32 res = _spu->read_dec().first;
 
 		if (res > 1500 && g_cfg.core.spu_loop_detection)
 		{
@@ -6015,7 +6053,7 @@ public:
 					break;
 				}
 
-				if (u64 cmdh = ci->getZExtValue() & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_RESULT_MASK); !g_use_rtm)
+				if (u64 cmdh = ci->getZExtValue() & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_RESULT_MASK); g_cfg.core.rsx_fifo_accuracy || !g_use_rtm)
 				{
 					// TODO: don't require TSX (current implementation is TSX-only)
 					if (cmdh == MFC_PUT_CMD || cmdh == MFC_SNDSIG_CMD)
@@ -6165,19 +6203,42 @@ public:
 					}
 					}
 
+					// Check if the LS address is constant and 256 bit aligned
+					u64 clsa = umax;
+
+					if (auto ci = llvm::dyn_cast<llvm::ConstantInt>(lsa.value))
+					{
+						clsa = ci->getZExtValue();
+					}
+
+					u32 stride = 16;
+
+					if (m_use_avx && csize >= 32 && !(clsa % 32))
+					{
+						vtype = get_type<u8(*)[32]>();
+						stride = 32;
+					}
+
 					if (csize > 0 && csize <= 16)
 					{
 						// Generate single copy operation
 						m_ir->CreateStore(m_ir->CreateLoad(m_ir->CreateBitCast(src, vtype), true), m_ir->CreateBitCast(dst, vtype), true);
 					}
-					else if (csize <= 256)
+					else if (csize <= stride * 16 && !(csize % 32))
 					{
 						// Generate fixed sequence of copy operations
-						for (u32 i = 0; i < csize; i += 16)
+						for (u32 i = 0; i < csize; i += stride)
 						{
 							const auto _src = m_ir->CreateGEP(src, m_ir->getInt32(i));
 							const auto _dst = m_ir->CreateGEP(dst, m_ir->getInt32(i));
-							m_ir->CreateStore(m_ir->CreateLoad(m_ir->CreateBitCast(_src, vtype), true), m_ir->CreateBitCast(_dst, vtype), true);
+							if (csize - i < stride)
+							{
+								m_ir->CreateStore(m_ir->CreateLoad(m_ir->CreateBitCast(_src, get_type<u8(*)[16]>()), true), m_ir->CreateBitCast(_dst, get_type<u8(*)[16]>()), true);
+							}
+							else
+							{
+								m_ir->CreateAlignedStore(m_ir->CreateAlignedLoad(m_ir->CreateBitCast(_src, vtype), llvm::MaybeAlign{16}), m_ir->CreateBitCast(_dst, vtype), llvm::MaybeAlign{16});
+							}
 						}
 					}
 					else if (csize)
@@ -6322,6 +6383,7 @@ public:
 			call("spu_get_events", &exec_get_events, m_thread, m_ir->getInt32(SPU_EVENT_TM));
 			m_ir->CreateStore(call("get_timebased_time", &get_timebased_time), spu_ptr<u64>(&spu_thread::ch_dec_start_timestamp));
 			m_ir->CreateStore(val.value, spu_ptr<u32>(&spu_thread::ch_dec_value));
+			m_ir->CreateStore(m_ir->getInt8(0), spu_ptr<u8>(&spu_thread::is_dec_frozen));
 			return;
 		}
 		case SPU_Set_Bkmk_Tag:
@@ -6804,11 +6866,21 @@ public:
 		set_vr(op.rt, fshl(a, zshuffle(a, 4, 0, 1, 2), b));
 	}
 
+#if defined(ARCH_X64)
 	static __m128i exec_rotqby(__m128i a, u8 b)
 	{
 		alignas(32) const __m128i buf[2]{a, a};
 		return _mm_loadu_si128(reinterpret_cast<const __m128i*>(reinterpret_cast<const u8*>(buf) + (16 - (b & 0xf))));
 	}
+#else
+	static v128 exec_rotqby(v128 a, u8 b)
+	{
+		alignas(32) const v128 buf[2]{a, a};
+		alignas(16) v128 res;
+		std::memcpy(&res, reinterpret_cast<const u8*>(buf) + (16 - (b & 0xf)), 16);
+		return res;
+	}
+#endif
 
 	void ROTQBY(spu_opcode_t op)
 	{
@@ -6818,7 +6890,7 @@ public:
 		if (!m_use_ssse3)
 		{
 			value_t<u8[16]> r;
-			r.value = call("spu_rotqby", &exec_rotqby, a.value, eval(extract(b, 12)).value);
+			r.value = call<u8[16]>("spu_rotqby", &exec_rotqby, a.value, eval(extract(b, 12)).value);
 			set_vr(op.rt, r);
 			return;
 		}
@@ -6999,7 +7071,7 @@ public:
 
 	void SHLQBYI(spu_opcode_t op)
 	{
-		if (!m_interp_magn && !op.i7) return set_vr(op.rt, get_vr(op.ra)); // For expressions matching
+		if (get_reg_raw(op.ra) && !op.i7) return set_reg_fixed(op.rt, get_reg_raw(op.ra), false); // For expressions matching
 		const auto a = get_vr<u8[16]>(op.ra);
 		const auto sc = build<u8[16]>(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
 		const auto sh = sc - (get_imm<u8[16]>(op.i7, false) & 0x1f);
@@ -7227,19 +7299,19 @@ public:
 
 	void ORI(spu_opcode_t op)
 	{
-		if (!m_interp_magn && !op.si10) return set_vr(op.rt, get_vr(op.ra)); // For expressions matching
+		if (get_reg_raw(op.ra) && !op.si10) return set_reg_fixed(op.rt, get_reg_raw(op.ra), false); // For expressions matching
 		set_vr(op.rt, get_vr<s32[4]>(op.ra) | get_imm<s32[4]>(op.si10));
 	}
 
 	void ORHI(spu_opcode_t op)
 	{
-		if (!m_interp_magn && !op.si10) return set_vr(op.rt, get_vr(op.ra));
+		if (get_reg_raw(op.ra) && !op.si10) return set_reg_fixed(op.rt, get_reg_raw(op.ra), false);
 		set_vr(op.rt, get_vr<s16[8]>(op.ra) | get_imm<s16[8]>(op.si10));
 	}
 
 	void ORBI(spu_opcode_t op)
 	{
-		if (!m_interp_magn && !op.si10) return set_vr(op.rt, get_vr(op.ra));
+		if (get_reg_raw(op.ra) && !op.si10) return set_reg_fixed(op.rt, get_reg_raw(op.ra), false);
 		set_vr(op.rt, get_vr<s8[16]>(op.ra) | get_imm<s8[16]>(op.si10));
 	}
 
@@ -7255,49 +7327,49 @@ public:
 
 	void ANDI(spu_opcode_t op)
 	{
-		if (!m_interp_magn && op.si10 == -1) return set_vr(op.rt, get_vr(op.ra));
+		if (get_reg_raw(op.ra) && op.si10 == -1) return set_reg_fixed(op.rt, get_reg_raw(op.ra), false);
 		set_vr(op.rt, get_vr<s32[4]>(op.ra) & get_imm<s32[4]>(op.si10));
 	}
 
 	void ANDHI(spu_opcode_t op)
 	{
-		if (!m_interp_magn && op.si10 == -1) return set_vr(op.rt, get_vr(op.ra));
+		if (get_reg_raw(op.ra) && op.si10 == -1) return set_reg_fixed(op.rt, get_reg_raw(op.ra), false);
 		set_vr(op.rt, get_vr<s16[8]>(op.ra) & get_imm<s16[8]>(op.si10));
 	}
 
 	void ANDBI(spu_opcode_t op)
 	{
-		if (!m_interp_magn && static_cast<s8>(op.si10) == -1) return set_vr(op.rt, get_vr(op.ra));
+		if (get_reg_raw(op.ra) && static_cast<s8>(op.si10) == -1) return set_reg_fixed(op.rt, get_reg_raw(op.ra), false);
 		set_vr(op.rt, get_vr<s8[16]>(op.ra) & get_imm<s8[16]>(op.si10));
 	}
 
 	void AI(spu_opcode_t op)
 	{
-		if (!m_interp_magn && !op.si10) return set_vr(op.rt, get_vr(op.ra));
+		if (get_reg_raw(op.ra) && !op.si10) return set_reg_fixed(op.rt, get_reg_raw(op.ra), false);
 		set_vr(op.rt, get_vr<s32[4]>(op.ra) + get_imm<s32[4]>(op.si10));
 	}
 
 	void AHI(spu_opcode_t op)
 	{
-		if (!m_interp_magn && !op.si10) return set_vr(op.rt, get_vr(op.ra));
+		if (get_reg_raw(op.ra) && !op.si10) return set_reg_fixed(op.rt, get_reg_raw(op.ra), false);
 		set_vr(op.rt, get_vr<s16[8]>(op.ra) + get_imm<s16[8]>(op.si10));
 	}
 
 	void XORI(spu_opcode_t op)
 	{
-		if (!m_interp_magn && !op.si10) return set_vr(op.rt, get_vr(op.ra));
+		if (get_reg_raw(op.ra) && !op.si10) return set_reg_fixed(op.rt, get_reg_raw(op.ra), false);
 		set_vr(op.rt, get_vr<s32[4]>(op.ra) ^ get_imm<s32[4]>(op.si10));
 	}
 
 	void XORHI(spu_opcode_t op)
 	{
-		if (!m_interp_magn && !op.si10) return set_vr(op.rt, get_vr(op.ra));
+		if (get_reg_raw(op.ra) && !op.si10) return set_reg_fixed(op.rt, get_reg_raw(op.ra), false);
 		set_vr(op.rt, get_vr<s16[8]>(op.ra) ^ get_imm<s16[8]>(op.si10));
 	}
 
 	void XORBI(spu_opcode_t op)
 	{
-		if (!m_interp_magn && !op.si10) return set_vr(op.rt, get_vr(op.ra));
+		if (get_reg_raw(op.ra) && !op.si10) return set_reg_fixed(op.rt, get_reg_raw(op.ra), false);
 		set_vr(op.rt, get_vr<s8[16]>(op.ra) ^ get_imm<s8[16]>(op.si10));
 	}
 
@@ -7714,19 +7786,19 @@ public:
 			}
 		}
 
-		if (m_use_avx512_icl && (op.ra != op.rb || m_interp_magn))
+		if (m_use_avx512_icl && (op.ra != op.rb))
 		{
 			if (perm_only)
 			{
-				set_vr(op.rt4, vperm2b256to128(b, a, eval(~c)));
+				set_vr(op.rt4, vperm2b256to128(a, b, eval(c ^ 0xf)));
 				return;
 			}
 
 			const auto m = gf2p8affineqb(c, build<u8[16]>(0x40, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x40, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20), 0x7f);
 			const auto mm = select(noncast<s8[16]>(m) >= 0, splat<u8[16]>(0), m);
-			const auto cr = eval(~c);
-			const auto ab = vperm2b256to128(b, a, cr);
-			set_vr(op.rt4, select(noncast<s8[16]>(cr) >= 0, mm, ab));
+			const auto cr = eval(c ^ 0xf);
+			const auto ab = vperm2b256to128(a, b, cr);
+			set_vr(op.rt4, select(noncast<s8[16]>(c) >= 0, ab, mm));
 			return;
 		}
 
@@ -7801,7 +7873,7 @@ public:
 	{
 		const auto [a, b, c] = get_vrs<f64[2]>(op.ra, op.rb, op.rt);
 
-		if (g_cfg.core.llvm_accurate_dfma)
+		if (g_cfg.core.use_accurate_dfma)
 			set_vr(op.rt, fmuladd(a, b, c, true));
 		else
 			set_vr(op.rt, a * b + c);
@@ -7811,7 +7883,7 @@ public:
 	{
 		const auto [a, b, c] = get_vrs<f64[2]>(op.ra, op.rb, op.rt);
 
-		if (g_cfg.core.llvm_accurate_dfma)
+		if (g_cfg.core.use_accurate_dfma)
 			set_vr(op.rt, fmuladd(a, b, -c, true));
 		else
 			set_vr(op.rt, a * b - c);
@@ -7821,7 +7893,7 @@ public:
 	{
 		const auto [a, b, c] = get_vrs<f64[2]>(op.ra, op.rb, op.rt);
 
-		if (g_cfg.core.llvm_accurate_dfma)
+		if (g_cfg.core.use_accurate_dfma)
 			set_vr(op.rt, fmuladd(-a, b, c, true));
 		else
 			set_vr(op.rt, c - (a * b));
@@ -7831,7 +7903,7 @@ public:
 	{
 		const auto [a, b, c] = get_vrs<f64[2]>(op.ra, op.rb, op.rt);
 
-		if (g_cfg.core.llvm_accurate_dfma)
+		if (g_cfg.core.use_accurate_dfma)
 			set_vr(op.rt, -fmuladd(a, b, c, true));
 		else
 			set_vr(op.rt, -(a * b + c));
@@ -7865,6 +7937,22 @@ public:
 
 	value_t<f32[4]> clamp_smax(value_t<f32[4]> v)
 	{
+		if (m_use_avx512)
+		{
+			if (is_input_positive(v))
+			{
+				return eval(clamp_positive_smax(v));
+			}
+
+			if (auto [ok, data] = get_const_vector(v.value, m_pos); ok)
+			{
+				// Avoid pessimation when input is constant
+				return eval(clamp_positive_smax(clamp_negative_smax(v)));
+			}
+
+			return eval(vrangeps(v, fsplat<f32[4]>(std::bit_cast<f32, u32>(0x7f7fffff)), 0x2, 0xff));
+		}
+
 		return eval(clamp_positive_smax(clamp_negative_smax(v)));
 	}
 
@@ -8001,7 +8089,7 @@ public:
 				return eval(sext<s32[4]>(bitcast<s32[4]>(a) > bitcast<s32[4]>(b)));
 			}
 
-			if (g_cfg.core.spu_approx_xfloat)
+			if (g_cfg.core.spu_approx_xfloat || g_cfg.core.spu_relaxed_xfloat)
 			{
 				const auto ai = eval(bitcast<s32[4]>(a));
 				const auto bi = eval(bitcast<s32[4]>(b));
@@ -8461,7 +8549,7 @@ public:
 			const auto b = value<f32[4]>(ci->getOperand(1));
 			const auto c = value<f32[4]>(ci->getOperand(2));
 
-			if (g_cfg.core.spu_approx_xfloat)
+			if (g_cfg.core.spu_approx_xfloat || g_cfg.core.spu_relaxed_xfloat)
 			{
 				return fma32x4(eval(-clamp_smax(a)), clamp_smax(b), c);
 			}
@@ -8968,10 +9056,15 @@ public:
 		set_vr(op.rt, make_load_ls(addr));
 	}
 
+	llvm::Value* get_pc_as_u64(u32 addr)
+	{
+		return m_ir->CreateAdd(m_ir->CreateZExt(m_base_pc, get_type<u64>()), m_ir->getInt64(addr - m_base));
+	}
+
 	void STQR(spu_opcode_t op) //
 	{
 		value_t<u64> addr;
-		addr.value = m_ir->CreateZExt(m_interp_magn ? m_interp_pc : get_pc(m_pos), get_type<u64>());
+		addr.value = m_interp_magn ? m_ir->CreateZExt(m_interp_pc, get_type<u64>()) : get_pc_as_u64(m_pos);
 		addr = eval(((get_imm<u64>(op.i16, false) << 2) + addr) & (m_interp_magn ? 0x3fff0 : ~0xf));
 		make_store_ls(addr, get_vr<u8[16]>(op.rt));
 	}
@@ -8979,7 +9072,7 @@ public:
 	void LQR(spu_opcode_t op) //
 	{
 		value_t<u64> addr;
-		addr.value = m_ir->CreateZExt(m_interp_magn ? m_interp_pc : get_pc(m_pos), get_type<u64>());
+		addr.value = m_interp_magn ? m_ir->CreateZExt(m_interp_pc, get_type<u64>()) : get_pc_as_u64(m_pos);
 		addr = eval(((get_imm<u64>(op.i16, false) << 2) + addr) & (m_interp_magn ? 0x3fff0 : ~0xf));
 		set_vr(op.rt, make_load_ls(addr));
 	}
@@ -9890,11 +9983,11 @@ std::unique_ptr<spu_recompiler_base> spu_recompiler_base::make_llvm_recompiler(u
 	return std::make_unique<spu_llvm_recompiler>(magn);
 }
 
-const spu_decoder<spu_llvm_recompiler> g_spu_llvm_decoder;
+const spu_decoder<spu_llvm_recompiler> s_spu_llvm_decoder;
 
 decltype(&spu_llvm_recompiler::UNK) spu_llvm_recompiler::decode(u32 op)
 {
-	return g_spu_llvm_decoder.decode(op);
+	return s_spu_llvm_decoder.decode(op);
 }
 
 #else
@@ -10021,6 +10114,11 @@ struct spu_llvm
 
 	void operator()()
 	{
+		if (g_cfg.core.spu_decoder != spu_decoder_type::llvm)
+		{
+			return;
+		}
+
 		// To compile (hash -> item)
 		std::unordered_multimap<u64, spu_item*, value_hash<u64>> enqueued;
 
@@ -10341,7 +10439,7 @@ struct spu_fast : public spu_recompiler_base
 			// Fix endianness
 			const spu_opcode_t op{std::bit_cast<be_t<u32>>(func.data[i])};
 
-			switch (auto type = s_spu_itype.decode(op.opcode))
+			switch (auto type = g_spu_itype.decode(op.opcode))
 			{
 			case spu_itype::BRZ:
 			case spu_itype::BRHZ:

@@ -12,10 +12,6 @@
 
 namespace vk
 {
-#ifdef _MSC_VER
-	extern "C" void _mm_pause();
-#endif
-
 	fence::fence(VkDevice dev)
 	{
 		owner                  = dev;
@@ -48,11 +44,7 @@ namespace vk
 	{
 		while (!flushed)
 		{
-#ifdef _MSC_VER
-			_mm_pause();
-#else
-			__builtin_ia32_pause();
-#endif
+			utils::pause();
 		}
 	}
 
@@ -61,22 +53,33 @@ namespace vk
 		return (handle != VK_NULL_HANDLE);
 	}
 
-	event::event(const render_device& dev, sync_domain domain)
+	semaphore::semaphore(const render_device& dev)
+		: m_device(dev)
 	{
-		m_device = dev;
-		if (domain == sync_domain::gpu || dev.gpu().get_driver_vendor() != driver_vendor::AMD)
+		VkSemaphoreCreateInfo info{};
+		info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+		CHECK_RESULT(vkCreateSemaphore(m_device, &info, nullptr, &m_handle));
+	}
+
+	semaphore::~semaphore()
+	{
+		vkDestroySemaphore(m_device, m_handle, nullptr);
+	}
+
+	semaphore::operator VkSemaphore() const
+	{
+		return m_handle;
+	}
+
+	event::event(const render_device& dev, sync_domain domain)
+		: m_device(dev)
+	{
+		const auto vendor = dev.gpu().get_driver_vendor();
+		if (domain != sync_domain::gpu &&
+			(vendor == vk::driver_vendor::AMD || vendor == vk::driver_vendor::INTEL))
 		{
-			VkEventCreateInfo info
-			{
-				.sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO,
-				.pNext = nullptr,
-				.flags = 0
-			};
-			vkCreateEvent(dev, &info, nullptr, &m_vk_event);
-		}
-		else
-		{
-			// Work around AMD's broken event signals
+			// Work around AMD and INTEL broken event signal synchronization scope
+			// Will be dropped after transitioning to VK1.3
 			m_buffer = std::make_unique<buffer>
 			(
 				dev,
@@ -90,6 +93,16 @@ namespace vk
 
 			m_value = reinterpret_cast<u32*>(m_buffer->map(0, 4));
 			*m_value = 0xCAFEBABE;
+		}
+		else
+		{
+			VkEventCreateInfo info
+			{
+				.sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO,
+				.pNext = nullptr,
+				.flags = 0
+			};
+			vkCreateEvent(dev, &info, nullptr, &m_vk_event);
 		}
 	}
 
@@ -171,6 +184,7 @@ namespace vk
 				switch (status)
 				{
 				case VK_NOT_READY:
+					utils::pause();
 					continue;
 				default:
 					die_with_error(status);
@@ -218,11 +232,7 @@ namespace vk
 				}
 			}
 
-#ifdef _MSC_VER
-			_mm_pause();
-#else
-			__builtin_ia32_pause();
-#endif
+			utils::pause();
 		}
 	}
 }

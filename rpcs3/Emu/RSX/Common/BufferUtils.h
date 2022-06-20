@@ -4,12 +4,6 @@
 
 #include <span>
 
-/**
- * Write count vertex attributes from src_ptr.
- * src_ptr array layout is deduced from the type, vector element count and src_stride arguments.
- */
-void write_vertex_array_data_to_buffer(std::span<std::byte> raw_dst_span, std::span<const std::byte> src_ptr, u32 count, rsx::vertex_base_type type, u32 vector_element_count, u32 attribute_src_stride, u8 dst_stride, bool swap_endianness);
-
 /*
  * If primitive mode is not supported and need to be emulated (using an index buffer) returns false.
  */
@@ -44,21 +38,8 @@ std::tuple<u32, u32, u32> write_index_array_data_to_buffer(std::span<std::byte> 
  */
 void write_index_array_for_non_indexed_non_native_primitive_to_buffer(char* dst, rsx::primitive_type draw_mode, unsigned count);
 
-/**
- * Stream a 128 bits vector to dst.
- */
-void stream_vector(void *dst, f32 x, f32 y, f32 z, f32 w);
-void stream_vector(void *dst, u32 x, u32 y, u32 z, u32 w);
+// Copy and swap data in 32-bit units
+extern void(*const copy_data_swap_u32)(u32*, const u32*, u32);
 
-/**
- * Stream a 128 bits vector from src to dst.
- */
-void stream_vector_from_memory(void *dst, void *src);
-
-/**
- * Stream and swap data in u32 units.
- */
-template <bool unaligned = false>
-void stream_data_to_memory_swapped_u32(void *dst, const void *src, u32 vertex_count, u8 stride);
-template <bool unaligned = false>
-bool stream_data_to_memory_swapped_and_compare_u32(void *dst, const void *src, u32 size);
+// Copy and swap data in 32-bit units, return true if changed
+extern bool(*const copy_data_swap_u32_cmp)(u32*, const u32*, u32);

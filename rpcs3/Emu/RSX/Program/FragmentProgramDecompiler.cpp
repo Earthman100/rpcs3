@@ -330,7 +330,7 @@ bool FragmentProgramDecompiler::DstExpectsSca() const
 
 std::string FragmentProgramDecompiler::Format(const std::string& code, bool ignore_redirects)
 {
-	const std::pair<std::string, std::function<std::string()>> repl_list[] =
+	const std::pair<std::string_view, std::function<std::string()>> repl_list[] =
 	{
 		{ "$$", []() -> std::string { return "$"; } },
 		{ "$0", [this]() -> std::string {return GetSRC<SRC0>(src0);} },
@@ -369,7 +369,7 @@ std::string FragmentProgramDecompiler::Format(const std::string& code, bool igno
 		{
 			//Redirect parameter 0 to the x2d temp register for TEXBEM
 			//TODO: Organize this a little better
-			std::pair<std::string, std::string> repl[] = { { "$0", "x2d" } };
+			std::pair<std::string_view, std::string> repl[] = { { "$0", "x2d" } };
 			std::string result = fmt::replace_all(code, repl);
 
 			return fmt::replace_all(result, repl_list);
@@ -1099,18 +1099,21 @@ bool FragmentProgramDecompiler::handle_tex_srb(u32 opcode)
 			}
 		}
 
-		// Sanity checks
-		if (func_id != base_func && base_func != FUNCTION::TEXTURE_SAMPLE_BASE)
-		{
-			// A lot of redundant special-access modes would be needed to cater for all the variations, ignore special modifiers for now, but log an error
-			rsx_log.error("[Unimplemented warning] Conflicting texture decode options in the shaders detected. Base option=%d, selected=%d", static_cast<int>(base_func), static_cast<int>(func_id));
-		}
-
 		ensure(func_id <= FUNCTION::TEXTURE_SAMPLE_MAX_BASE_ENUM && func_id >= FUNCTION::TEXTURE_SAMPLE_BASE);
 
-		// Clamp type to 3 types (1d, 2d, cube+3d) and offset into sampling redirection table
-		const auto type_offset = (std::min(static_cast<int>(type), 2) + 1) * static_cast<int>(FUNCTION::TEXTURE_SAMPLE_BASE_ENUM_COUNT);
-		func_id = static_cast<FUNCTION>(static_cast<int>(func_id) + type_offset);
+		if (!(m_prog.texture_state.multisampled_textures & ref_mask)) [[ likely ]]
+		{
+			// Clamp type to 3 types (1d, 2d, cube+3d) and offset into sampling redirection table
+			const auto type_offset = (std::min(static_cast<int>(type), 2) + 1) * static_cast<int>(FUNCTION::TEXTURE_SAMPLE_BASE_ENUM_COUNT);
+			func_id = static_cast<FUNCTION>(static_cast<int>(func_id) + type_offset);
+		}
+		else
+		{
+			// Map to multisample op
+			ensure(type <= rsx::texture_dimension_extended::texture_dimension_2d);
+			properties.multisampled_sampler_mask |= ref_mask;
+			func_id = static_cast<FUNCTION>(static_cast<int>(func_id) - static_cast<int>(FUNCTION::TEXTURE_SAMPLE_BASE) + static_cast<int>(FUNCTION::TEXTURE_SAMPLE2DMS));
+		}
 
 		if (dst.exp_tex)
 		{

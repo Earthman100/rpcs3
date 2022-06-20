@@ -35,6 +35,7 @@ namespace utils
 
 #include "asm.hpp"
 #include "endian.hpp"
+#include "tsc.hpp"
 
 // Total number of entries.
 static constexpr usz s_hashtable_size = 1u << 17;
@@ -664,10 +665,17 @@ static void cond_free(u32 cond_id, u32 tls_slot = -1)
 
 static cond_handle* cond_id_lock(u32 cond_id, u128 mask, uptr iptr = 0)
 {
-	if (cond_id - 1 < u16{umax})
-	{
-		const auto cond = s_cond_list + cond_id;
+	bool did_ref = false;
 
+	if (cond_id - 1 >= u16{umax})
+	{
+		return nullptr;
+	}
+
+	const auto cond = s_cond_list + cond_id;
+
+	while (true)
+	{
 		const auto [old, ok] = cond->ptr_ref.fetch_op([&](u64& val)
 		{
 			if (!val || (val & s_ref_mask) == s_ref_mask)
@@ -694,12 +702,23 @@ static cond_handle* cond_id_lock(u32 cond_id, u128 mask, uptr iptr = 0)
 				return false;
 			}
 
-			val++;
+			if (!did_ref)
+			{
+				val++;
+			}
+
 			return true;
 		});
 
 		if (ok)
 		{
+			// Check other fields again
+			if (const u32 sync_val = cond->sync; sync_val == 0 || sync_val == 3 || (cond->size && !(mask & cond->mask)))
+			{
+				did_ref = true;
+				continue;
+			}
+
 			return cond;
 		}
 
@@ -707,6 +726,13 @@ static cond_handle* cond_id_lock(u32 cond_id, u128 mask, uptr iptr = 0)
 		{
 			fmt::throw_exception("Reference count limit (131071) reached in an atomic notifier.");
 		}
+
+		break;
+	}
+
+	if (did_ref)
+	{
+		cond_free(cond_id, -1);
 	}
 
 	return nullptr;
@@ -804,17 +830,9 @@ namespace
 	};
 }
 
-#ifdef _MSC_VER
-extern "C" u64 __rdtsc();
-#endif
-
 u64 utils::get_unique_tsc()
 {
-#ifdef _MSC_VER
-	const u64 stamp0 = __rdtsc();
-#else
-    const u64 stamp0 = __builtin_ia32_rdtsc();
-#endif
+	const u64 stamp0 = utils::get_tsc();
 
 	return s_min_tsc.atomic_op([&](u64& tsc)
 	{
@@ -940,7 +958,7 @@ template <typename F>
 FORCE_INLINE auto root_info::slot_search(uptr iptr, u128 mask, F func) noexcept
 {
 	u32 index = 0;
-	u32 total = 0;
+	[[maybe_unused]] u32 total = 0;
 
 	for (hash_engine _this(iptr);; _this.advance())
 	{
@@ -1317,14 +1335,10 @@ void atomic_wait_engine::notify_one(const void* data, u32 size, u128 mask)
 	if (s_tls_notify_cb)
 		s_tls_notify_cb(data, 0);
 
-	u64 progress = 0;
-
 	root_info::slot_search(iptr, mask, [&](u32 cond_id)
 	{
 		if (alert_sema(cond_id, size, mask))
 		{
-			if (s_tls_notify_cb)
-				s_tls_notify_cb(data, ++progress);
 			return true;
 		}
 
@@ -1342,19 +1356,24 @@ SAFE_BUFFERS(void) atomic_wait_engine::notify_all(const void* data, u32 size, u1
 	if (s_tls_notify_cb)
 		s_tls_notify_cb(data, 0);
 
-	u64 progress = 0;
-
 	// Array count for batch notification
 	u32 count = 0;
 
 	// Array itself.
-	u32 cond_ids[max_threads * max_distance + 128];
+	u32 cond_ids[128];
 
 	root_info::slot_search(iptr, mask, [&](u32 cond_id)
 	{
+		if (count >= 128)
+		{
+			// Unusual big amount of sema: fallback to notify_one alg
+			alert_sema(cond_id, size, mask);
+			return false;
+		}
+
 		u32 res = alert_sema<true>(cond_id, size, mask);
 
-		if (res && ~res <= u16{umax})
+		if (~res <= u16{umax})
 		{
 			// Add to the end of the "stack"
 			*(std::end(cond_ids) - ++count) = ~res;
@@ -1385,8 +1404,6 @@ SAFE_BUFFERS(void) atomic_wait_engine::notify_all(const void* data, u32 size, u1
 			{
 				if (s_cond_list[cond_id].try_alert_native())
 				{
-					if (s_tls_notify_cb)
-						s_tls_notify_cb(data, ++progress);
 					*(std::end(cond_ids) - i - 1) = ~cond_id;
 				}
 			}
@@ -1401,8 +1418,6 @@ SAFE_BUFFERS(void) atomic_wait_engine::notify_all(const void* data, u32 size, u1
 		if (cond_id <= u16{umax})
 		{
 			s_cond_list[cond_id].alert_native();
-			if (s_tls_notify_cb)
-				s_tls_notify_cb(data, ++progress);
 			*(std::end(cond_ids) - i - 1) = ~cond_id;
 		}
 	}

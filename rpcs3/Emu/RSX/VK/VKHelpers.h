@@ -18,9 +18,6 @@
 
 #define OCCLUSION_MAX_POOL_SIZE   DESCRIPTOR_MAX_DRAW_CALLS
 
-#define FRAME_PRESENT_TIMEOUT 10000000ull // 10 seconds
-#define GENERAL_WAIT_TIMEOUT  2000000ull  // 2 seconds
-
 namespace vk
 {
 	// Forward declarations
@@ -31,7 +28,7 @@ namespace vk
 	class image;
 	class instance;
 	class render_device;
-	struct submit_packet;
+	struct queue_submit_t;
 
 	enum runtime_state
 	{
@@ -53,7 +50,7 @@ namespace vk
 	// Sync helpers around vkQueueSubmit
 	void acquire_global_submit_lock();
 	void release_global_submit_lock();
-	void queue_submit(const vk::submit_packet* packet);
+	void queue_submit(const vk::queue_submit_t* packet);
 
 	template<class T>
 	T* get_compute_task();

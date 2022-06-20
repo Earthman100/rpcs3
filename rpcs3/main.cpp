@@ -2,6 +2,9 @@
 // by Sacha Refshauge, Megamouse and flash-fire
 
 #include <iostream>
+#include <chrono>
+#include <sstream>
+#include <iomanip>
 
 #include <QApplication>
 #include <QCommandLineParser>
@@ -15,6 +18,7 @@
 #include <QJsonDocument>
 #include <QMessageBox>
 #include <QMetaEnum>
+#include <QStandardPaths>
 
 #include "rpcs3qt/gui_application.h"
 #include "rpcs3qt/fatal_error_dialog.h"
@@ -23,6 +27,7 @@
 
 #include "headless_application.h"
 #include "Utilities/sema.h"
+#include "Crypto/decrypt_binaries.h"
 #ifdef _WIN32
 #include <windows.h>
 #include "util/dyn_lib.hpp"
@@ -42,6 +47,7 @@ DYNAMIC_IMPORT("ntdll.dll", NtSetTimerResolution, NTSTATUS(ULONG DesiredResoluti
 #include <spawn.h>
 #include <sys/wait.h>
 #include <stdlib.h>
+#include <signal.h>
 #endif
 
 #ifdef __linux__
@@ -49,7 +55,7 @@ DYNAMIC_IMPORT("ntdll.dll", NtSetTimerResolution, NTSTATUS(ULONG DesiredResoluti
 #include <sys/resource.h>
 #endif
 
-#ifdef __APPLE__
+#if defined(__APPLE__)
 #include <dispatch/dispatch.h>
 #endif
 
@@ -93,10 +99,10 @@ LOG_CHANNEL(q_debug, "QDEBUG");
 		buf = std::string(_text);
 
 		// Always print thread id
-		fmt::append(buf, "\nThread id = %s.", std::this_thread::get_id());
+		fmt::append(buf, "\n\nThread id = %s.", std::this_thread::get_id());
 	}
 
-	const std::string_view text = buf.empty() ? _text : buf;
+	std::string_view text = buf.empty() ? _text : buf;
 
 	if (s_headless)
 	{
@@ -124,17 +130,16 @@ LOG_CHANNEL(q_debug, "QDEBUG");
 		std::cerr << fmt::format("RPCS3: %s\n", text);
 	}
 
-	auto show_report = [](std::string_view text)
+	static auto show_report = [](std::string_view text)
 	{
 		fatal_error_dialog dlg(text);
 		dlg.exec();
 	};
 
-#ifdef __APPLE__
-	// Cocoa access is not allowed outside of the main thread
+#if defined(__APPLE__)
 	if (!pthread_main_np())
 	{
-		dispatch_sync(dispatch_get_main_queue(), ^ { show_report(text); });
+		dispatch_sync_f(dispatch_get_main_queue(), &text, [](void* text){ show_report(*static_cast<std::string_view*>(text)); });
 	}
 	else
 #endif
@@ -142,9 +147,12 @@ LOG_CHANNEL(q_debug, "QDEBUG");
 		// If Qt is already initialized, spawn a new RPCS3 process with an --error argument
 		if (local)
 		{
-			// Since we only show an error, we can hope for a graceful exit
 			show_report(text);
-			std::exit(0);
+#ifdef _WIN32
+			ExitProcess(0);
+#else
+			kill(getpid(), SIGKILL);
+#endif
 		}
 
 #ifdef _WIN32
@@ -235,7 +243,12 @@ struct fatal_error_listener final : logs::listener
 	}
 };
 
+// Arguments that force a headless application (need to be checked in create_application)
 constexpr auto arg_headless     = "headless";
+constexpr auto arg_decrypt      = "decrypt";
+constexpr auto arg_commit_db    = "get-commit-db";
+
+// Arguments that can be used with a gui application
 constexpr auto arg_no_gui       = "no-gui";
 constexpr auto arg_high_dpi     = "hidpi";
 constexpr auto arg_rounding     = "dpi-rounding";
@@ -249,9 +262,9 @@ constexpr auto arg_updating     = "updating";
 constexpr auto arg_user_id      = "user-id";
 constexpr auto arg_installfw    = "installfw";
 constexpr auto arg_installpkg   = "installpkg";
-constexpr auto arg_commit_db    = "get-commit-db";
 constexpr auto arg_timer        = "high-res-timer";
 constexpr auto arg_verbose_curl = "verbose-curl";
+constexpr auto arg_any_location = "allow-any-location";
 
 int find_arg(std::string arg, int& argc, char* argv[])
 {
@@ -262,10 +275,14 @@ int find_arg(std::string arg, int& argc, char* argv[])
 	return -1;
 }
 
-QCoreApplication* createApplication(int& argc, char* argv[])
+QCoreApplication* create_application(int& argc, char* argv[])
 {
-	if (find_arg(arg_headless, argc, argv) != -1)
+	if (find_arg(arg_headless, argc, argv) != -1 ||
+		find_arg(arg_decrypt, argc, argv) != -1 ||
+		find_arg(arg_commit_db, argc, argv) != -1)
+	{
 		return new headless_application(argc, argv);
+	}
 
 #ifdef __linux__
 	// set the DISPLAY variable in order to open web browsers
@@ -359,6 +376,16 @@ void log_q_debug(QtMsgType type, const QMessageLogContext& context, const QStrin
 	}
 }
 
+template <>
+void fmt_class_string<std::chrono::sys_time<typename std::chrono::system_clock::duration>>::format(std::string& out, u64 arg)
+{
+	std::ostringstream ss;
+	const std::time_t dateTime = std::chrono::system_clock::to_time_t(get_object(arg));
+ 	const std::tm tm = *std::localtime(&dateTime);
+	ss << std::put_time(&tm, "%Y-%m-%eT%H:%M:%S");
+ 	out += ss.str();
+}
+
 
 
 int main(int argc, char** argv)
@@ -408,7 +435,7 @@ int main(int argc, char** argv)
 		{
 			if (fs::exists(lock_name))
 			{
-				report_fatal_error("Another instance of RPCS3 is running. Close it or kill its process, if necessary.");
+				report_fatal_error("Another instance of RPCS3 is running.\nClose it or kill its process, if necessary.");
 			}
 
 			report_fatal_error("Cannot create RPCS3.log (access denied)."
@@ -428,6 +455,9 @@ int main(int argc, char** argv)
 	{
 		report_fatal_error("Not enough memory for RPCS3 process.");
 	}
+
+	WSADATA wsa_data;
+	WSAStartup(MAKEWORD(2, 2), &wsa_data);
 #endif
 
 	ensure(thread_ctrl::is_main(), "Not main thread");
@@ -457,21 +487,24 @@ int main(int argc, char** argv)
 	{
 		// Write RPCS3 version
 		logs::stored_message ver{sys_log.always()};
-		ver.text  = fmt::format("RPCS3 v%s | %s", rpcs3::get_version().to_string(), rpcs3::get_branch());
+		ver.text = fmt::format("RPCS3 v%s", rpcs3::get_verbose_version());
 
 		// Write System information
 		logs::stored_message sys{sys_log.always()};
-		sys.text  = utils::get_system_info();
+		sys.text = utils::get_system_info();
 
 		// Write OS version
 		logs::stored_message os{sys_log.always()};
-		os.text  = utils::get_OS_version();
+		os.text = utils::get_OS_version();
 
 		// Write Qt version
 		logs::stored_message qt{(strcmp(QT_VERSION_STR, qVersion()) != 0) ? sys_log.error : sys_log.notice};
-		qt.text  = fmt::format("Qt version: Compiled against Qt %s | Run-time uses Qt %s", QT_VERSION_STR, qVersion());
+		qt.text = fmt::format("Qt version: Compiled against Qt %s | Run-time uses Qt %s", QT_VERSION_STR, qVersion());
 
-		logs::set_init({std::move(ver), std::move(sys), std::move(os), std::move(qt)});
+		logs::stored_message time{sys_log.always()};
+		time.text = fmt::format("Current Time: %s", std::chrono::system_clock::now());
+
+		logs::set_init({std::move(ver), std::move(sys), std::move(os), std::move(qt), std::move(time)});
 	}
 
 #ifdef _WIN32
@@ -494,18 +527,42 @@ int main(int argc, char** argv)
 	rlim.rlim_max = 4096;
 #ifdef RLIMIT_NOFILE
 	if (::setrlimit(RLIMIT_NOFILE, &rlim) != 0)
+	{
 		std::cerr << "Failed to set max open file limit (4096).\n";
+	}
 #endif
 
 	rlim.rlim_cur = 0x80000000;
 	rlim.rlim_max = 0x80000000;
 #ifdef RLIMIT_MEMLOCK
 	if (::setrlimit(RLIMIT_MEMLOCK, &rlim) != 0)
+	{
 		std::cerr << "Failed to set RLIMIT_MEMLOCK size to 2 GiB. Try to update your system configuration.\n";
+	}
 #endif
 	// Work around crash on startup on KDE: https://bugs.kde.org/show_bug.cgi?id=401637
 	setenv( "KDE_DEBUG", "1", 0 );
 #endif
+
+#ifdef __APPLE__
+	struct ::rlimit rlim;
+	::getrlimit(RLIMIT_NOFILE, &rlim);
+	rlim.rlim_cur = OPEN_MAX;
+	if (::setrlimit(RLIMIT_NOFILE, &rlim) != 0)
+	{
+		std::cerr << "Failed to set max open file limit (" << OPEN_MAX << ").\n";
+	}
+#endif
+
+#ifndef _WIN32
+	// Write file limits
+	sys_log.notice("Maximum open file descriptors: %i", utils::get_maxfiles());
+#endif
+
+	if (utils::get_low_power_mode())
+	{
+		sys_log.error("Low Power Mode is enabled, performance may be reduced.");
+	}
 
 	std::lock_guard qt_init(s_qt_init);
 
@@ -514,9 +571,10 @@ int main(int argc, char** argv)
 	// but I haven't found an implicit way to check for style yet, so we naively check them both here for now.
 	const bool use_cli_style = find_arg(arg_style, argc, argv) != -1 || find_arg(arg_stylesheet, argc, argv) != -1;
 
-	QScopedPointer<QCoreApplication> app(createApplication(argc, argv));
+	QScopedPointer<QCoreApplication> app(create_application(argc, argv));
 	app->setApplicationVersion(QString::fromStdString(rpcs3::get_version().to_string()));
 	app->setApplicationName("RPCS3");
+	app->setOrganizationName("RPCS3");
 
 	// Command line args
 	static QCommandLineParser parser;
@@ -539,6 +597,8 @@ int main(int argc, char** argv)
 	parser.addOption(installfw_option);
 	const QCommandLineOption installpkg_option(arg_installpkg, "Forces the emulator to install this pkg file.", "path", "");
 	parser.addOption(installpkg_option);
+	const QCommandLineOption decrypt_option(arg_decrypt, "Decrypt PS3 binaries.", "path(s)", "");
+	parser.addOption(decrypt_option);
 	const QCommandLineOption user_id_option(arg_user_id, "Start RPCS3 as this user.", "user id", "");
 	parser.addOption(user_id_option);
 	parser.addOption(QCommandLineOption(arg_q_debug, "Log qDebug to RPCS3.log."));
@@ -547,6 +607,7 @@ int main(int argc, char** argv)
 	parser.addOption(QCommandLineOption(arg_commit_db, "Update commits.lst cache. Optional arguments: <path> <sha>"));
 	parser.addOption(QCommandLineOption(arg_timer, "Enable high resolution timer for better performance (windows)", "enabled", "1"));
 	parser.addOption(QCommandLineOption(arg_verbose_curl, "Enable verbose curl logging."));
+	parser.addOption(QCommandLineOption(arg_any_location, "Allow RPCS3 to be run from any location. Dangerous"));
 	parser.process(app->arguments());
 
 	// Don't start up the full rpcs3 gui if we just want the version or help.
@@ -857,6 +918,25 @@ int main(int argc, char** argv)
 		report_fatal_error("RPCS3 initialization failed!");
 	}
 
+	// Check if the current location is actually useable
+	if (!parser.isSet(arg_any_location))
+	{
+		const std::string emu_dir = rpcs3::utils::get_emu_dir();
+
+		// Check temporary directories
+		for (const QString& path : QStandardPaths::standardLocations(QStandardPaths::StandardLocation::TempLocation))
+		{
+			if (Emu.IsPathInsideDir(emu_dir, path.toStdString()))
+			{
+				report_fatal_error(fmt::format(
+					"RPCS3 should never be run from a temporary location!\n"
+					"Please install RPCS3 in a persistent location.\n"
+					"Current location:\n%s", emu_dir));
+				return 1;
+			}
+		}
+	}
+
 #ifdef _WIN32
 	// Create dummy permanent low resolution timer to workaround messing with system timer resolution
 	QTimer* dummy_timer = new QTimer(app.data());
@@ -891,6 +971,57 @@ int main(int argc, char** argv)
 		sys_log.notice("Timer resolution: %d us (min=%d us, max=%d us)", orig_res / 10, min_res / 10, max_res / 10);
 	}
 #endif
+
+	if (parser.isSet(arg_decrypt))
+	{
+#ifdef _WIN32
+		if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole())
+		{
+			[[maybe_unused]] const auto con_out = freopen("CONOUT$", "w", stdout);
+			[[maybe_unused]] const auto con_in = freopen("CONIN$", "r", stdin);
+		}
+#endif
+
+		std::vector<std::string> vec_modules;
+		for (const QString& mod : parser.values(decrypt_option))
+		{
+			const QFileInfo fi(mod);
+			if (!fi.exists())
+			{
+				std::cout << "File not found: " << mod.toStdString() << std::endl;
+				return 1;
+			}
+			if (!fi.isFile())
+			{
+				std::cout << "Not a file: " << mod.toStdString() << std::endl;
+				return 1;
+			}
+			vec_modules.push_back(fi.absoluteFilePath().toStdString());
+		}
+
+		const auto input_cb = [](std::string old_path, std::string path, bool tried) -> std::string
+		{
+			const std::string hint = fmt::format("Hint: KLIC (KLicense key) is a 16-byte long string. (32 hexadecimal characters)"
+				"\nAnd is logged with some sceNpDrm* functions when the game/application which owns \"%0\" is running.", path);
+
+			if (tried)
+			{
+				std::cout << "Failed to decrypt " << old_path << " with specfied KLIC, retrying.\n" << hint << std::endl;
+			}
+
+			std::cout << "Enter KLIC of " << path << "\nHexadecimal only, 32 characters:" << std::endl;
+
+			std::string input;
+			std::cin >> input;
+
+			return input;
+		};
+
+		Emu.Init();
+		decrypt_sprx_libraries(vec_modules, input_cb);
+		Emu.Quit(true);
+		return 0;
+	}
 
 	// Force install firmware or pkg first if specified through command-line
 	if (parser.isSet(arg_installfw) || parser.isSet(arg_installpkg))
@@ -965,7 +1096,7 @@ int main(int argc, char** argv)
 		}
 
 		// Postpone startup to main event loop
-		Emu.CallAfter([path = sstr(QFileInfo(args.at(0)).absoluteFilePath()), rpcs3_argv = std::move(rpcs3_argv), config_path = std::move(config_path)]() mutable
+		Emu.CallFromMainThread([path = sstr(QFileInfo(args.at(0)).absoluteFilePath()), rpcs3_argv = std::move(rpcs3_argv), config_path = std::move(config_path)]() mutable
 		{
 			Emu.argv = std::move(rpcs3_argv);
 			Emu.SetForceBoot(true);
@@ -982,6 +1113,24 @@ int main(int argc, char** argv)
 				}
 			}
 		});
+	}
+	else if (s_headless || s_no_gui)
+	{
+#ifdef _WIN32
+		// If launched from CMD
+		if (AttachConsole(ATTACH_PARENT_PROCESS))
+			[[maybe_unused]] const auto con_out = freopen("CONOUT$", "w", stderr);
+#endif
+		sys_log.error("Cannot run %s mode without boot target. Terminating...", s_headless ? "headless" : "no-gui");
+		fprintf(stderr, "Cannot run %s mode without boot target. Terminating...\n", s_headless ? "headless" : "no-gui");
+
+		if (s_no_gui)
+		{
+			QMessageBox::warning(nullptr, QObject::tr("Missing command-line arguments!"), QObject::tr("Cannot run no-gui mode without boot target.\nTerminating..."));
+		}
+
+		Emu.Quit(true);
+		return 0;
 	}
 
 	// run event loop (maybe only needed for the gui application)

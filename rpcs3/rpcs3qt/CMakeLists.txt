@@ -32,6 +32,7 @@ set(SRC_FILES
     gui_settings.cpp
     input_dialog.cpp
     instruction_editor_dialog.cpp
+    ipc_settings_dialog.cpp
     kernel_explorer.cpp
     localized.cpp
     localized_emu.h
@@ -53,6 +54,8 @@ set(SRC_FILES
     qt_camera_error_handler.cpp
     qt_camera_handler.cpp
     qt_camera_video_surface.cpp
+    qt_music_error_handler.cpp
+    qt_music_handler.cpp
     qt_utils.cpp
     register_editor_dialog.cpp
     recvmessage_dialog_frame.cpp
@@ -68,6 +71,7 @@ set(SRC_FILES
     sendmessage_dialog_frame.cpp
     settings.cpp
     settings_dialog.cpp
+    shortcut_utils.cpp
     skylander_dialog.cpp
     syntax_highlighter.cpp
     tooltips.cpp
@@ -78,7 +82,10 @@ set(SRC_FILES
     user_account.cpp
     user_manager_dialog.cpp
     vfs_dialog.cpp
+    vfs_dialog_path_widget.cpp
     vfs_dialog_tab.cpp
+    vfs_dialog_usb_input.cpp
+    vfs_dialog_usb_tab.cpp
     welcome_dialog.cpp
 )
 

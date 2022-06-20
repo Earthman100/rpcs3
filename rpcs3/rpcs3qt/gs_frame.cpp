@@ -10,7 +10,9 @@
 #include "Emu/system_progress.hpp"
 #include "Emu/IdManager.h"
 #include "Emu/Cell/Modules/cellScreenshot.h"
+#include "Emu/Cell/Modules/cellVideoOut.h"
 #include "Emu/RSX/rsx_utils.h"
+#include "Emu/RSX/Overlays/overlay_message.h"
 
 #include <QApplication>
 #include <QDateTime>
@@ -51,6 +53,7 @@ LOG_CHANNEL(mark_log, "MARK");
 LOG_CHANNEL(gui_log, "GUI");
 
 extern atomic_t<bool> g_user_asked_for_frame_capture;
+extern atomic_t<bool> g_disable_frame_limit;
 
 constexpr auto qstr = QString::fromStdString;
 
@@ -268,6 +271,14 @@ void gs_frame::keyPressEvent(QKeyEvent *keyEvent)
 			return;
 		}
 		break;
+	case Qt::Key_F10:
+		if (keyEvent->modifiers() == Qt::ControlModifier)
+		{
+			g_disable_frame_limit = !g_disable_frame_limit;
+			gui_log.warning("%s boost mode", g_disable_frame_limit.load() ? "Enabled" : "Disabled");
+			return;
+		}
+		break;
 	case Qt::Key_F12:
 		screenshot_toggle = true;
 		break;
@@ -278,7 +289,7 @@ void gs_frame::keyPressEvent(QKeyEvent *keyEvent)
 
 void gs_frame::toggle_fullscreen()
 {
-	Emu.CallAfter([this]()
+	Emu.CallFromMainThread([this]()
 	{
 		if (visibility() == FullScreen)
 		{
@@ -347,22 +358,35 @@ bool gs_frame::get_mouse_lock_state()
 	return isActive() && m_mouse_hide_and_lock;
 }
 
+void gs_frame::hide_on_close()
+{
+	if (!(+g_progr))
+	{
+		// Hide the dialog before stopping if no progress bar is being shown.
+		// Otherwise users might think that the game softlocked if stopping takes too long.
+		QWindow::hide();
+	}
+}
+
 void gs_frame::close()
 {
+	if (m_is_closing.exchange(true))
+	{
+		gui_log.notice("Closing game window (ignored, already closing)");
+		return;
+	}
+
 	gui_log.notice("Closing game window");
 
-	Emu.CallAfter([this]()
+	Emu.CallFromMainThread([this]()
 	{
-		if (!(+g_progr))
-		{
-			// Hide the dialog before stopping if no progress bar is being shown.
-			// Otherwise users might think that the game softlocked if stopping takes too long.
-			QWindow::hide();
-		}
+		// Hide window if necessary
+		hide_on_close();
 
 		if (!Emu.IsStopped())
 		{
-			Emu.Stop();
+			// Blocking shutdown request. Obsolete, but I'm keeping it here as last resort.
+			Emu.GracefulShutdown(true, false);
 		}
 
 		deleteLater();
@@ -376,12 +400,12 @@ bool gs_frame::shown()
 
 void gs_frame::hide()
 {
-	Emu.CallAfter([this]() { QWindow::hide(); });
+	Emu.CallFromMainThread([this]() { QWindow::hide(); });
 }
 
 void gs_frame::show()
 {
-	Emu.CallAfter([this]()
+	Emu.CallFromMainThread([this]()
 	{
 		QWindow::show();
 		if (g_cfg.misc.start_fullscreen)
@@ -497,7 +521,7 @@ void gs_frame::flip(draw_context_t, bool /*skip_frame*/)
 		{
 			m_window_title = new_title;
 
-			Emu.CallAfter([this, title = std::move(new_title)]()
+			Emu.CallFromMainThread([this, title = std::move(new_title)]()
 			{
 				setTitle(qstr(title));
 			});
@@ -522,7 +546,7 @@ void gs_frame::take_screenshot(std::vector<u8> data, const u32 sshot_width, cons
 				screen_path += id + "/";
 			};
 
-			if (!fs::create_dir(screen_path) && fs::g_tls_error != fs::error::exist)
+			if (!fs::create_path(screen_path) && fs::g_tls_error != fs::error::exist)
 			{
 				screenshot_log.error("Failed to create screenshot path \"%s\" : %s", screen_path, fs::g_tls_error);
 				return;
@@ -618,16 +642,30 @@ void gs_frame::take_screenshot(std::vector<u8> data, const u32 sshot_width, cons
 			text[num_text].key         = const_cast<char*>("Comment");
 			text[num_text].text        = const_cast<char*>(game_comment.c_str());
 
-			std::vector<u8*> rows(sshot_height);
-			for (usz y = 0; y < sshot_height; y++)
-				rows[y] = sshot_data_alpha.data() + y * sshot_width * 4;
+			// Create image from data
+			QImage img(sshot_data_alpha.data(), sshot_width, sshot_height, sshot_width * 4, QImage::Format_RGBA8888);
+
+			// Scale image if necessary
+			const auto& avconf = g_fxo->get<rsx::avconf>();
+			auto new_size = avconf.aspect_convert_dimensions(size2u{ u32(img.width()), u32(img.height()) });
+
+			if (new_size.width != static_cast<u32>(img.width()) || new_size.height != static_cast<u32>(img.height()))
+			{
+				img = img.scaled(QSize(new_size.width, new_size.height), Qt::AspectRatioMode::IgnoreAspectRatio, Qt::TransformationMode::SmoothTransformation);
+				img.convertTo(QImage::Format_RGBA8888); // The current Qt version changes the image format during smooth scaling, so we have to change it back.
+			}
+
+			// Create row pointers for libpng
+			std::vector<u8*> rows(img.height());
+			for (int y = 0; y < img.height(); y++)
+				rows[y] = img.scanLine(y);
 
 			std::vector<u8> encoded_png;
 
 			const auto write_png = [&]()
 			{
 				const scoped_png_ptrs ptrs;
-				png_set_IHDR(ptrs.write_ptr, ptrs.info_ptr, sshot_width, sshot_height, 8, PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+				png_set_IHDR(ptrs.write_ptr, ptrs.info_ptr, img.width(), img.height(), 8, PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
 				png_set_text(ptrs.write_ptr, ptrs.info_ptr, text, 6);
 				png_set_rows(ptrs.write_ptr, ptrs.info_ptr, &rows[0]);
 				png_set_write_fn(ptrs.write_ptr, &encoded_png, [](png_structp png_ptr, png_bytep data, png_size_t length)
@@ -660,10 +698,11 @@ void gs_frame::take_screenshot(std::vector<u8> data, const u32 sshot_width, cons
 
 					// Games choose the overlay file and the offset based on the current video resolution.
 					// We need to scale the overlay if our resolution scaling causes the image to have a different size.
-					auto& avconf = g_fxo->get<rsx::avconf>();
 
-					// TODO: handle wacky PS3 resolutions (without resolution scaling)
-					if (avconf.resolution_x != sshot_width || avconf.resolution_y != sshot_height)
+					// Scale the resolution first (as seen before with the image)
+					new_size = avconf.aspect_convert_dimensions(size2u{ avconf.resolution_x, avconf.resolution_y });
+
+					if (new_size.width != static_cast<u32>(img.width()) || new_size.height != static_cast<u32>(img.height()))
 					{
 						const int scale = rsx::get_resolution_scale_percent();
 						const int x = (scale * manager.overlay_offset_x) / 100;
@@ -679,16 +718,16 @@ void gs_frame::take_screenshot(std::vector<u8> data, const u32 sshot_width, cons
 						overlay_img = overlay_img.scaled(QSize(width, height), Qt::AspectRatioMode::IgnoreAspectRatio, Qt::TransformationMode::SmoothTransformation);
 					}
 
-					if (manager.overlay_offset_x < static_cast<s64>(sshot_width) &&
-					    manager.overlay_offset_y < static_cast<s64>(sshot_height) &&
+					if (manager.overlay_offset_x < static_cast<s64>(img.width()) &&
+					    manager.overlay_offset_y < static_cast<s64>(img.height()) &&
 					    manager.overlay_offset_x + overlay_img.width() > 0 &&
 					    manager.overlay_offset_y + overlay_img.height() > 0)
 					{
-						QImage screenshot_img(rows[0], sshot_width, sshot_height, QImage::Format_RGBA8888);
+						QImage screenshot_img(rows[0], img.width(), img.height(), QImage::Format_RGBA8888);
 						QPainter painter(&screenshot_img);
 						painter.drawImage(manager.overlay_offset_x, manager.overlay_offset_y, overlay_img);
 
-						std::memcpy(rows[0], screenshot_img.constBits(), static_cast<usz>(sshot_height) * screenshot_img.bytesPerLine());
+						std::memcpy(rows[0], screenshot_img.constBits(), screenshot_img.sizeInBytes());
 
 						screenshot_log.success("Applied screenshot overlay '%s'", cell_sshot_overlay_path);
 					}
@@ -720,7 +759,7 @@ void gs_frame::take_screenshot(std::vector<u8> data, const u32 sshot_width, cons
 			}
 
 			// Play a sound
-			Emu.CallAfter([]()
+			Emu.CallFromMainThread([]()
 			{
 				if (const std::string sound_path = fs::get_config_dir() + "sounds/snd_screenshot.wav"; fs::is_file(sound_path))
 				{
@@ -731,6 +770,10 @@ void gs_frame::take_screenshot(std::vector<u8> data, const u32 sshot_width, cons
 					QApplication::beep();
 				}
 			});
+
+			ensure(filename.find(fs::get_config_dir()) != filename.npos);
+			const std::string shortpath = filename.substr(fs::get_config_dir().size() - 1); // -1 for /
+			rsx::overlays::queue_message(tr("Screenshot saved: %0").arg(QString::fromStdString(shortpath)).toStdString());
 
 			return;
 		},
@@ -792,19 +835,9 @@ bool gs_frame::event(QEvent* ev)
 			}
 
 			int result = QMessageBox::Yes;
-			atomic_t<bool> called = false;
-
-			Emu.CallAfter([this, &result, &called]()
-			{
-				m_gui_settings->ShowConfirmationBox(tr("Exit Game?"),
-					tr("Do you really want to exit the game?<br><br>Any unsaved progress will be lost!<br>"),
-					gui::ib_confirm_exit, &result, nullptr);
-
-				called = true;
-				called.notify_one();
-			});
-
-			called.wait(false);
+			m_gui_settings->ShowConfirmationBox(tr("Exit Game?"),
+				tr("Do you really want to exit the game?<br><br>Any unsaved progress will be lost!<br>"),
+				gui::ib_confirm_exit, &result, nullptr);
 
 			if (result != QMessageBox::Yes)
 			{
@@ -813,7 +846,23 @@ bool gs_frame::event(QEvent* ev)
 		}
 
 		gui_log.notice("Game window close event issued");
-		close();
+
+		if (Emu.IsStopped())
+		{
+			// This should be unreachable, but never say never. Properly close the window anyway.
+			close();
+		}
+		else
+		{
+			// Issue async shutdown
+			Emu.GracefulShutdown(true, true);
+
+			// Hide window if necessary
+			hide_on_close();
+
+			// Do not propagate the close event. It will be closed by the rsx_thread.
+			return true;
+		}
 	}
 	else if (ev->type() == QEvent::MouseMove && (!m_show_mouse || m_mousehide_timer.isActive()))
 	{

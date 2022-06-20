@@ -12,6 +12,25 @@ namespace fs
 
 namespace psf
 {
+	enum sound_format_flag : s32
+	{
+		lpcm_2   = 1 << 0, // Linear PCM 2 Ch.
+		lpcm_5_1 = 1 << 2, // Linear PCM 5.1 Ch.
+		lpcm_7_1 = 1 << 4, // Linear PCM 7.1 Ch.
+		ac3      = 1 << 8, // Dolby Digital 5.1 Ch.
+		dts      = 1 << 9, // DTS 5.1 Ch.
+	};
+
+	enum resolution_flag : s32
+	{
+		_480p      = 1 << 0,
+		_576p      = 1 << 1,
+		_720p      = 1 << 2,
+		_1080p     = 1 << 3,
+		_480p_16_9 = 1 << 4,
+		_576p_16_9 = 1 << 5,
+	};
+
 	enum class format : u16
 	{
 		array   = 0x0004, // claimed to be a non-NTS string (char array)
@@ -41,7 +60,7 @@ namespace psf
 		// Construct integer entry, assign the value
 		entry(u32 value);
 
-		~entry();
+		~entry() = default;
 
 		const std::string& as_string() const;
 		u32 as_integer() const;
@@ -55,7 +74,7 @@ namespace psf
 	};
 
 	// Define PSF registry as a sorted map of entries:
-	using registry = std::map<std::string, entry>;
+	using registry = std::map<std::string, entry, std::less<>>;
 
 	struct load_result_t
 	{
@@ -77,13 +96,13 @@ namespace psf
 	std::vector<u8> save_object(const registry&, std::vector<u8>&& init = std::vector<u8>{});
 
 	// Get string value or default value
-	std::string_view get_string(const registry& psf, const std::string& key, std::string_view def = ""sv);
+	std::string_view get_string(const registry& psf, std::string_view key, std::string_view def = ""sv);
 
 	// Get integer value or default value
-	u32 get_integer(const registry& psf, const std::string& key, u32 def = 0);
+	u32 get_integer(const registry& psf, std::string_view key, u32 def = 0);
 
 	// Assign new entry
-	inline void assign(registry& psf, const std::string& key, entry&& _entry)
+	inline void assign(registry& psf, std::string_view key, entry&& _entry)
 	{
 		const auto found = psf.find(key);
 
@@ -107,5 +126,11 @@ namespace psf
 	inline entry array(u32 max_size, std::string_view value)
 	{
 		return {format::array, max_size, value};
+	}
+
+	// Checks if of HDD catgeory (assumes a valid category is being passed)
+	constexpr bool is_cat_hdd(std::string_view cat)
+	{
+		return cat.size() == 2u && cat[1] != 'D' && cat != "DG"sv && cat != "MS"sv;
 	}
 }

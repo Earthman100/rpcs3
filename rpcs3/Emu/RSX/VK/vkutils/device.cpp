@@ -3,6 +3,10 @@
 #include "util/logs.hpp"
 #include "Emu/system_config.h"
 
+#ifdef __APPLE__
+#include <MoltenVK/vk_mvk_moltenvk.h>
+#endif
+
 namespace vk
 {
 	// Global shared render device
@@ -121,6 +125,34 @@ namespace vk
 			_vkGetPhysicalDeviceProperties2KHR(dev, &properties2);
 			props = properties2.properties;
 
+#ifdef __APPLE__
+		if (instance_extensions.is_supported(VK_MVK_MOLTENVK_EXTENSION_NAME))
+		{
+			MVKConfiguration mvk_config = {};
+			size_t mvk_config_size = sizeof(MVKConfiguration);
+
+			PFN_vkGetMoltenVKConfigurationMVK _vkGetMoltenVKConfigurationMVK = nullptr;
+			_vkGetMoltenVKConfigurationMVK = reinterpret_cast<PFN_vkGetMoltenVKConfigurationMVK>(vkGetInstanceProcAddr(parent, "vkGetMoltenVKConfigurationMVK"));
+			ensure(_vkGetMoltenVKConfigurationMVK);
+
+			PFN_vkSetMoltenVKConfigurationMVK _vkSetMoltenVKConfigurationMVK = nullptr;
+			_vkSetMoltenVKConfigurationMVK = reinterpret_cast<PFN_vkSetMoltenVKConfigurationMVK>(vkGetInstanceProcAddr(parent, "vkSetMoltenVKConfigurationMVK"));
+			ensure(_vkSetMoltenVKConfigurationMVK);
+
+			CHECK_RESULT_EX(_vkGetMoltenVKConfigurationMVK(VK_NULL_HANDLE, &mvk_config, &mvk_config_size), std::string("Could not get MoltenVK configuration."));
+
+			mvk_config.resumeLostDevice = true;
+			mvk_config.semaphoreUseMTLEvent = mvk_config.semaphoreUseMTLFence = !(g_cfg.video.mvk_software_vksemaphore.get());
+			mvk_config.fastMathEnabled = !(g_cfg.video.disable_msl_fast_math.get());
+
+			CHECK_RESULT_EX(_vkSetMoltenVKConfigurationMVK(VK_NULL_HANDLE, &mvk_config, &mvk_config_size), std::string("Could not set MoltenVK configuration."));
+		}
+		else
+		{
+			rsx_log.error("Cannot set the MoltenVK configuration because VK_MVK_moltenvk is not supported.\nIf you're using MoltenVK through libvulkan, please manually set the appropriate environment variables instead.");
+		}
+#endif
+
 			if (descriptor_indexing_support)
 			{
 				if (descriptor_indexing_props.maxUpdateAfterBindDescriptorsInAllPools < 800'000)
@@ -183,9 +215,16 @@ namespace vk
 
 	driver_vendor physical_device::get_driver_vendor() const
 	{
+#ifdef __APPLE__
+		// moltenVK currently returns DRIVER_ID_MOLTENVK (0).
+		// For now, assume the vendor is moltenVK on Apple devices.
+		return driver_vendor::MVK;
+#endif
+
 		if (!driver_properties.driverID)
 		{
 			const auto gpu_name = get_name();
+
 			if (gpu_name.find("Radeon") != umax)
 			{
 				return driver_vendor::AMD;
@@ -452,6 +491,18 @@ namespace vk
 			enabled_features.shaderStorageImageWriteWithoutFormat = VK_FALSE;
 		}
 
+		if (!pgpu->features.shaderClipDistance)
+		{
+			rsx_log.error("Your GPU does not support shader clip distance. Graphics will not render correctly.");
+			enabled_features.shaderClipDistance = VK_FALSE;
+		}
+
+		if (!pgpu->features.shaderStorageBufferArrayDynamicIndexing)
+		{
+			rsx_log.error("Your GPU does not support shader storage buffer array dynamic indexing. Graphics will not render correctly.");
+			enabled_features.shaderStorageBufferArrayDynamicIndexing = VK_FALSE;
+		}
+
 		if (!pgpu->features.samplerAnisotropy)
 		{
 			rsx_log.error("Your GPU does not support anisotropic filtering. Graphics may not render correctly.");
@@ -495,6 +546,14 @@ namespace vk
 			enabled_features.occlusionQueryPrecise = VK_FALSE;
 		}
 
+#ifdef __APPLE__
+		if (!pgpu->features.logicOp)
+		{
+			rsx_log.error("Your GPU does not support framebuffer logical operations. Graphics may not render correctly.");
+			enabled_features.logicOp = VK_FALSE;
+		}
+#endif
+
 		VkDeviceCreateInfo device = {};
 		device.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 		device.pNext = nullptr;
@@ -512,6 +571,7 @@ namespace vk
 			// Allow use of f16 type in shaders if possible
 			shader_support_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT16_INT8_FEATURES_KHR;
 			shader_support_info.shaderFloat16 = VK_TRUE;
+			shader_support_info.pNext = const_cast<void*>(device.pNext);
 			device.pNext = &shader_support_info;
 
 			rsx_log.notice("GPU/driver supports float16 data types natively. Using native float16_t variables if possible.");
@@ -535,6 +595,7 @@ namespace vk
 #undef SET_DESCRIPTOR_BITFLAG
 
 			indexing_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
+			indexing_features.pNext = const_cast<void*>(device.pNext);
 			device.pNext = &indexing_features;
 		}
 
@@ -911,36 +972,42 @@ namespace vk
 
 	gpu_formats_support get_optimal_tiling_supported_formats(const physical_device& dev)
 	{
+		const auto test_format_features = [&dev](VkFormat format, VkFlags required_features, VkBool32 linear_features) -> bool
+		{
+			VkFormatProperties props;
+			vkGetPhysicalDeviceFormatProperties(dev, format, &props);
+
+			const auto supported_features_mask = (linear_features) ? props.linearTilingFeatures : props.optimalTilingFeatures;
+			return (supported_features_mask & required_features) == required_features;
+		};
+
 		gpu_formats_support result = {};
+		const VkFlags required_zbuffer_features = (VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+		const VkFlags required_colorbuffer_features = (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT);
 
-		VkFormatProperties props;
-		vkGetPhysicalDeviceFormatProperties(dev, VK_FORMAT_D24_UNORM_S8_UINT, &props);
-
-		result.d24_unorm_s8 = !!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) && !!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
-			!!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && !!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
-
-		vkGetPhysicalDeviceFormatProperties(dev, VK_FORMAT_D32_SFLOAT_S8_UINT, &props);
-		result.d32_sfloat_s8 = !!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) && !!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
-			!!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT);
+		// Check supported depth formats
+		result.d24_unorm_s8 = test_format_features(VK_FORMAT_D24_UNORM_S8_UINT, required_zbuffer_features, VK_FALSE);
+		result.d32_sfloat_s8 = test_format_features(VK_FORMAT_D32_SFLOAT_S8_UINT, required_zbuffer_features, VK_FALSE);
 
 		// Hide d24_s8 if force high precision z buffer is enabled
 		if (g_cfg.video.force_high_precision_z_buffer && result.d32_sfloat_s8)
+		{
 			result.d24_unorm_s8 = false;
+		}
 
-		// Checks if BGRA8 images can be used for blitting
-		vkGetPhysicalDeviceFormatProperties(dev, VK_FORMAT_B8G8R8A8_UNORM, &props);
-		result.bgra8_linear = !!(props.linearTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT);
+		// Checks if linear BGRA8 images can be used for present
+		result.bgra8_linear = test_format_features(VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_FEATURE_BLIT_SRC_BIT, VK_TRUE);
 
-		// Check if device supports RGBA8 format
-		vkGetPhysicalDeviceFormatProperties(dev, VK_FORMAT_R8G8B8A8_UNORM, &props);
-		if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) || !(props.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) ||
-			!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT))
+		// Check if device supports RGBA8 format for rendering
+		if (!test_format_features(VK_FORMAT_R8G8B8A8_UNORM, required_colorbuffer_features, VK_FALSE))
 		{
 			// Non-fatal. Most games use BGRA layout due to legacy reasons as old GPUs typically supported BGRA and RGBA was emulated.
 			rsx_log.error("Your GPU and/or driver does not support RGBA8 format. This can cause problems in some rare games that use this memory layout.");
 		}
 
-		result.argb8_linear = !!(props.linearTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT);
+		// Check if linear RGBA8 images can be used for present
+		result.argb8_linear = test_format_features(VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_FEATURE_BLIT_SRC_BIT, VK_TRUE);
+
 		return result;
 	}
 

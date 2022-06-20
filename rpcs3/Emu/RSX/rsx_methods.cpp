@@ -3,11 +3,10 @@
 #include "RSXThread.h"
 #include "rsx_utils.h"
 #include "rsx_decode.h"
+#include "Common/time.hpp"
 #include "Emu/Cell/PPUCallback.h"
 #include "Emu/Cell/lv2/sys_rsx.h"
 #include "Emu/RSX/Common/BufferUtils.h"
-
-#include <thread>
 
 namespace rsx
 {
@@ -22,13 +21,49 @@ namespace rsx
 		const u32 cmd = rsx->get_fifo_cmd();
 		rsx_log.error("Invalid RSX method 0x%x (arg=0x%x, start=0x%x, count=0x%x, non-inc=%s)", reg << 2, arg,
 		cmd & 0xfffc, (cmd >> 18) & 0x7ff, !!(cmd & RSX_METHOD_NON_INCREMENT_CMD));
-		rsx->recover_fifo();
+
+		if (g_cfg.core.rsx_fifo_accuracy != rsx_fifo_mode::as_ps3)
+		{
+			rsx->recover_fifo();
+		}
 	}
 
 	static void trace_method(thread* /*rsx*/, u32 reg, u32 arg)
 	{
 		// For unknown yet valid methods
 		rsx_log.trace("RSX method 0x%x (arg=0x%x)", reg << 2, arg);
+	}
+
+	template<bool FlushDMA, bool FlushPipe>
+	void write_gcm_label(thread* rsx, u32 address, u32 data)
+	{
+		const bool is_flip_sema = (address == (rsx->label_addr + 0x10) || address == (rsx->label_addr + 0x30));
+		if (!is_flip_sema)
+		{
+			// First, queue the GPU work. If it flushes the queue for us, the following routines will be faster.
+			const bool handled = rsx->get_backend_config().supports_host_gpu_labels && rsx->release_GCM_label(address, data);
+
+			if constexpr (FlushDMA)
+			{
+				// If the backend handled the request, this call will basically be a NOP
+				g_fxo->get<rsx::dma_manager>().sync();
+			}
+
+			if constexpr (FlushPipe)
+			{
+				// Manually flush the pipeline.
+				// It is possible to stream report writes using the host GPU, but that generates too much submit traffic.
+				rsx->sync();
+			}
+
+			if (handled)
+			{
+				// Backend will handle it, nothing to write.
+				return;
+			}
+		}
+
+		vm::_ref<RsxSemaphore>(address).val = data;
 	}
 
 	template<typename Type> struct vertex_data_type_from_element_type;
@@ -44,8 +79,10 @@ namespace rsx
 		{
 			rsx->sync();
 
-			// Write ref+get atomically (get will be written again with the same value at command end)
-			vm::_ref<atomic_be_t<u64>>(rsx->dma_address + ::offset32(&RsxDmaControl::get)).store(u64{rsx->fifo_ctrl->get_pos()} << 32 | arg);
+			// Write ref+get (get will be written again with the same value at command end)
+			auto& dma = vm::_ref<RsxDmaControl>(rsx->dma_address);
+			dma.get.release(rsx->fifo_ctrl->get_pos());
+			dma.ref.store(arg);
 		}
 
 		void semaphore_acquire(thread* rsx, u32 /*reg*/, u32 arg)
@@ -54,9 +91,6 @@ namespace rsx
 			const u32 addr = get_address(method_registers.semaphore_offset_406e(), method_registers.semaphore_context_dma_406e());
 
 			const auto& sema = vm::_ref<RsxSemaphore>(addr).val;
-
-			// TODO: Remove vblank semaphore hack
-			if (addr == rsx->device_addr + 0x30) return;
 
 			if (sema == arg)
 			{
@@ -74,36 +108,47 @@ namespace rsx
 				rsx->flush_fifo();
 			}
 
-			u64 start = get_system_time();
+			if (addr == rsx->device_addr + 0x30)
+			{
+				if (g_cfg.video.frame_limit == frame_limit_type::_ps3 && rsx->requested_vsync)
+				{
+					// Enables PS3-compliant vblank behavior
+					rsx->flip_sema_wait_val = arg;
+					rsx->wait_for_flip_sema = (sema != arg);
+				}
+
+				return;
+			}
+
+			u64 start = rsx::uclock();
+			u64 last_check_val = start;
+
 			while (sema != arg)
 			{
-				if (rsx->is_stopped())
+				if (rsx->test_stopped())
 				{
 					return;
 				}
 
 				if (const auto tdr = static_cast<u64>(g_cfg.video.driver_recovery_timeout))
 				{
-					if (rsx->is_paused())
+					const u64 current = rsx::uclock();
+
+					if (current - last_check_val > 20'000)
 					{
-						const u64 start0 = get_system_time();
-
-						while (rsx->is_paused())
-						{
-							rsx->cpu_wait({});
-						}
-
-						// Reset
-						start += get_system_time() - start0;
+						// Suspicious amnount of time has passed
+						// External pause such as debuggers' pause or operating system sleep may have taken place
+						// Ignore it
+						start += current - last_check_val;
 					}
-					else
+
+					last_check_val = current;
+
+					if ((current - start) > tdr)
 					{
-						if ((get_system_time() - start) > tdr)
-						{
-							// If longer than driver timeout force exit
-							rsx_log.error("nv406e::semaphore_acquire has timed out. semaphore_address=0x%X", addr);
-							break;
-						}
+						// If longer than driver timeout force exit
+						rsx_log.error("nv406e::semaphore_acquire has timed out. semaphore_address=0x%X", addr);
+						break;
 					}
 				}
 
@@ -111,13 +156,11 @@ namespace rsx
 			}
 
 			rsx->fifo_wake_delay();
-			rsx->performance_counters.idle_time += (get_system_time() - start);
+			rsx->performance_counters.idle_time += (rsx::uclock() - start);
 		}
 
 		void semaphore_release(thread* rsx, u32 /*reg*/, u32 arg)
 		{
-			rsx->sync();
-
 			const u32 offset = method_registers.semaphore_offset_406e();
 
 			if (offset % 4)
@@ -141,10 +184,12 @@ namespace rsx
 			// TODO: Check if possible to write on reservations
 			if (rsx->label_addr >> 28 != addr >> 28)
 			{
-				rsx_log.fatal("NV406E semaphore unexpected address. Please report to the developers. (offset=0x%x, addr=0x%x)", offset, addr);
+				rsx_log.error("NV406E semaphore unexpected address. Please report to the developers. (offset=0x%x, addr=0x%x)", offset, addr);
+				rsx->recover_fifo();
+				return;
 			}
 
-			vm::_ref<RsxSemaphore>(addr).val = arg;
+			write_gcm_label<false, true>(rsx, addr, arg);
 		}
 	}
 
@@ -206,12 +251,8 @@ namespace rsx
 
 		void texture_read_semaphore_release(thread* rsx, u32 /*reg*/, u32 arg)
 		{
-			// Pipeline barrier seems to be equivalent to a SHADER_READ stage barrier
-			g_fxo->get<rsx::dma_manager>().sync();
-			if (g_cfg.video.strict_rendering_mode)
-			{
-				rsx->sync();
-			}
+			// Pipeline barrier seems to be equivalent to a SHADER_READ stage barrier.
+			// Ideally the GPU only needs to have cached all textures declared up to this point before writing the label.
 
 			// lle-gcm likes to inject system reserved semaphores, presumably for system/vsh usage
 			// Avoid calling render to avoid any havoc(flickering) they may cause from invalid flush/write
@@ -224,14 +265,26 @@ namespace rsx
 				return;
 			}
 
-			vm::_ref<RsxSemaphore>(get_address(offset, method_registers.semaphore_context_dma_4097())).val = arg;
+			const u32 addr = get_address(offset, method_registers.semaphore_context_dma_4097());
+
+			if (rsx->label_addr >> 28 != addr >> 28)
+			{
+				rsx_log.error("NV4097 semaphore unexpected address. Please report to the developers. (offset=0x%x, addr=0x%x)", offset, addr);
+			}
+
+			if (g_cfg.video.strict_rendering_mode) [[ unlikely ]]
+			{
+				write_gcm_label<true, true>(rsx, addr, arg);
+			}
+			else
+			{
+				write_gcm_label<true, false>(rsx, addr, arg);
+			}
 		}
 
 		void back_end_write_semaphore_release(thread* rsx, u32 /*reg*/, u32 arg)
 		{
-			// Full pipeline barrier
-			g_fxo->get<rsx::dma_manager>().sync();
-			rsx->sync();
+			// Full pipeline barrier. GPU must flush pipeline before writing the label
 
 			const u32 offset = method_registers.semaphore_offset_4097();
 
@@ -242,8 +295,15 @@ namespace rsx
 				return;
 			}
 
+			const u32 addr = get_address(offset, method_registers.semaphore_context_dma_4097());
+
+			if (rsx->label_addr >> 28 != addr >> 28)
+			{
+				rsx_log.error("NV4097 semaphore unexpected address. Please report to the developers. (offset=0x%x, addr=0x%x)", offset, addr);
+			}
+
 			const u32 val = (arg & 0xff00ff00) | ((arg & 0xff) << 16) | ((arg >> 16) & 0xff);
-			vm::_ref<RsxSemaphore>(get_address(offset, method_registers.semaphore_context_dma_4097())).val = val;
+			write_gcm_label<true, true>(rsx, addr, val);
 		}
 
 		/**
@@ -407,17 +467,24 @@ namespace rsx
 			rsx::method_registers.current_draw_clause.inline_vertex_array.push_back(arg);
 		}
 
-		template<u32 index>
 		struct set_transform_constant
 		{
-			static void impl(thread* rsx, u32 /*reg*/, u32 /*arg*/)
+			static void impl(thread* rsx, u32 _reg, u32 /*arg*/)
 			{
-				static constexpr u32 reg = index / 4;
-				static constexpr u8 subreg = index % 4;
+				const u32 index = _reg - NV4097_SET_TRANSFORM_CONSTANT;
+				const u32 reg = index / 4;
+				const u8 subreg = index % 4;
 
-				// Get real args count
-				const u32 count = std::min<u32>({rsx->fifo_ctrl->get_remaining_args_count() + 1,
-					static_cast<u32>(((rsx->ctrl->put & ~3ull) - (rsx->fifo_ctrl->get_pos() - 4)) / 4), 32 - index});
+				// FIFO args count including this one
+				const u32 fifo_args_cnt = rsx->fifo_ctrl->get_remaining_args_count() + 1;
+
+				// The range of methods this function resposible to
+				const u32 method_range = 32 - index;
+
+				// Get limit imposed by FIFO PUT (if put is behind get it will result in a number ignored by min)
+				const u32 fifo_read_limit = static_cast<u32>(((rsx->ctrl->put & ~3ull) - (rsx->fifo_ctrl->get_pos())) / 4);
+
+				const u32 count = std::min<u32>({fifo_args_cnt, fifo_read_limit, method_range});
 
 				const u32 load = rsx::method_registers.transform_constant_load();
 
@@ -435,32 +502,47 @@ namespace rsx
 
 				const auto values = &rsx::method_registers.transform_constants[load + reg][subreg];
 
+				const auto fifo_span = rsx->fifo_ctrl->get_current_arg_ptr();
+
+				if (fifo_span.size() < rcount)
+				{
+					rcount = fifo_span.size();
+				}
+
 				if (rsx->m_graphics_state & rsx::pipeline_state::transform_constants_dirty)
 				{
 					// Minor optimization: don't compare values if we already know we need invalidation
-					stream_data_to_memory_swapped_u32<true>(values, vm::base(rsx->fifo_ctrl->get_current_arg_ptr()), rcount, 4);
+					copy_data_swap_u32(values, fifo_span.data(), rcount);
 				}
 				else
 				{
-					if (stream_data_to_memory_swapped_and_compare_u32<true>(values, vm::base(rsx->fifo_ctrl->get_current_arg_ptr()), rcount * 4))
+					if (copy_data_swap_u32_cmp(values, fifo_span.data(), rcount))
 					{
 						// Transform constants invalidation is expensive (~8k bytes per update)
 						rsx->m_graphics_state |= rsx::pipeline_state::transform_constants_dirty;
 					}
 				}
 
-				rsx->fifo_ctrl->skip_methods(count - 1);
+				rsx->fifo_ctrl->skip_methods(rcount - 1);
 			}
 		};
 
-		template<u32 index>
 		struct set_transform_program
 		{
-			static void impl(thread* rsx, u32 /*reg*/, u32 /*arg*/)
+			static void impl(thread* rsx, u32 reg, u32 /*arg*/)
 			{
-				// Get real args count
-				const u32 count = std::min<u32>({rsx->fifo_ctrl->get_remaining_args_count() + 1,
-					static_cast<u32>(((rsx->ctrl->put & ~3ull) - (rsx->fifo_ctrl->get_pos() - 4)) / 4), 32 - index});
+				const u32 index = reg - NV4097_SET_TRANSFORM_PROGRAM;
+
+				// FIFO args count including this one
+				const u32 fifo_args_cnt = rsx->fifo_ctrl->get_remaining_args_count() + 1;
+
+				// The range of methods this function resposible to
+				const u32 method_range = 32 - index;
+
+				// Get limit imposed by FIFO PUT (if put is behind get it will result in a number ignored by min)
+				const u32 fifo_read_limit = static_cast<u32>(((rsx->ctrl->put & ~3ull) - (rsx->fifo_ctrl->get_pos())) / 4);
+
+				const u32 count = std::min<u32>({fifo_args_cnt, fifo_read_limit, method_range});
 
 				const u32 load_pos = rsx::method_registers.transform_program_load();
 
@@ -473,12 +555,18 @@ namespace rsx
 					rcount -= max - (max_vertex_program_instructions * 4);
 				}
 
-				stream_data_to_memory_swapped_u32<true>(&rsx::method_registers.transform_program[load_pos * 4 + index % 4]
-					, vm::base(rsx->fifo_ctrl->get_current_arg_ptr()), rcount, 4);
+				const auto fifo_span = rsx->fifo_ctrl->get_current_arg_ptr();
+
+				if (fifo_span.size() < rcount)
+				{
+					rcount = fifo_span.size();
+				}
+
+				copy_data_swap_u32(&rsx::method_registers.transform_program[load_pos * 4 + index % 4], fifo_span.data(), rcount);
 
 				rsx->m_graphics_state |= rsx::pipeline_state::vertex_program_ucode_dirty;
 				rsx::method_registers.transform_program_load_set(load_pos + ((rcount + index % 4) / 4));
-				rsx->fifo_ctrl->skip_methods(count - 1);
+				rsx->fifo_ctrl->skip_methods(rcount - 1);
 			}
 		};
 
@@ -552,6 +640,14 @@ namespace rsx
 				}
 
 				rsx::method_registers.current_draw_clause.compile();
+
+				if (g_cfg.video.disable_video_output)
+				{
+					rsxthr->execute_nop_draw();
+					rsxthr->rsx::thread::end();
+					return;
+				}
+
 				rsxthr->end();
 			}
 			else
@@ -898,12 +994,12 @@ namespace rsx
 
 	namespace nv308a
 	{
-		template<u32 index>
 		struct color
 		{
-			static void impl(thread* rsx, u32 /*reg*/, u32 /*arg*/)
+			static void impl(thread* rsx, u32 reg, u32)
 			{
 				const u32 out_x_max = method_registers.nv308a_size_out_x();
+				const u32 index = reg - NV308A_COLOR;
 
 				if (index >= out_x_max)
 				{
@@ -912,11 +1008,18 @@ namespace rsx
 				}
 
 				// Get position of the current command arg
-				const u32 src_offset = rsx->fifo_ctrl->get_pos() - 4;
+				const u32 src_offset = rsx->fifo_ctrl->get_pos();
 
-				// Get real args count (starting from NV3089_COLOR)
-				const u32 count = std::min<u32>({rsx->fifo_ctrl->get_remaining_args_count() + 1,
-					static_cast<u32>(((rsx->ctrl->put & ~3ull) - src_offset) / 4), 0x700 - index, out_x_max - index});
+				// FIFO args count including this one
+				const u32 fifo_args_cnt = rsx->fifo_ctrl->get_remaining_args_count() + 1;
+
+				// The range of methods this function resposible to
+				const u32 method_range = std::min<u32>(0x700 - index, out_x_max - index);
+
+				// Get limit imposed by FIFO PUT (if put is behind get it will result in a number ignored by min)
+				const u32 fifo_read_limit = static_cast<u32>(((rsx->ctrl->put & ~3ull) - (rsx->fifo_ctrl->get_pos())) / 4);
+
+				u32 count = std::min<u32>({fifo_args_cnt, fifo_read_limit, method_range});
 
 				const u32 dst_dma = method_registers.blit_engine_output_location_nv3062();
 				const u32 dst_offset = method_registers.blit_engine_output_offset_nv3062();
@@ -924,6 +1027,13 @@ namespace rsx
 
 				const u32 x = method_registers.nv308a_x() + index;
 				const u32 y = method_registers.nv308a_y();
+
+				const auto fifo_span = rsx->fifo_ctrl->get_current_arg_ptr();
+
+				if (fifo_span.size() < count)
+				{
+					count = fifo_span.size();
+				}
 
 				// Skip "handled methods"
 				rsx->fifo_ctrl->skip_methods(count - 1);
@@ -945,12 +1055,10 @@ namespace rsx
 						return;
 					}
 
-					const auto src_address = get_address(src_offset, CELL_GCM_LOCATION_MAIN);
-
 					const auto dst = vm::_ptr<u8>(dst_address);
-					const auto src = vm::_ptr<const u8>(src_address);
+					const auto src = reinterpret_cast<const u8*>(fifo_span.data());
 
-					auto res = rsx::reservation_lock<true>(dst_address, data_length, src_address, data_length);
+					rsx::reservation_lock<true> rsx_lock(dst_address, data_length);
 
 					if (rsx->fifo_ctrl->last_cmd() & RSX_METHOD_NON_INCREMENT_CMD_MASK) [[unlikely]]
 					{
@@ -981,9 +1089,8 @@ namespace rsx
 					const auto data_length = count * 2;
 
 					const auto dst_address = get_address(dst_offset + (x * 2) + (y * out_pitch), dst_dma, data_length);
-					const auto src_address = get_address(src_offset, CELL_GCM_LOCATION_MAIN);
 					const auto dst = vm::_ptr<u16>(dst_address);
-					const auto src = vm::_ptr<const u32>(src_address);
+					const auto src = reinterpret_cast<const be_t<u32>*>(fifo_span.data());
 
 					if (!dst_address)
 					{
@@ -991,7 +1098,7 @@ namespace rsx
 						return;
 					}
 
-					auto res = rsx::reservation_lock<true>(dst_address, data_length, src_address, data_length);
+					rsx::reservation_lock<true> rsx_lock(dst_address, data_length);
 
 					auto convert = [](u32 input) -> u16
 					{
@@ -1668,8 +1775,26 @@ namespace rsx
 	void flip_command(thread* rsx, u32, u32 arg)
 	{
 		ensure(rsx->isHLE);
+
+		if (auto ptr = rsx->queue_handler)
+		{
+			rsx->intr_thread->cmd_list
+			({
+				{ ppu_cmd::set_args, 1 }, u64{1},
+				{ ppu_cmd::lle_call, ptr },
+				{ ppu_cmd::sleep, 0 }
+			});
+
+			rsx->intr_thread->cmd_notify++;
+			rsx->intr_thread->cmd_notify.notify_one();
+		}
+
 		rsx->reset();
+		nv4097::set_zcull_render_enable(rsx, 0, 0x3);
+		nv4097::set_render_mode(rsx, 0, 0x0100'0000);
+		rsx->on_frame_end(arg);
 		rsx->request_emu_flip(arg);
+		vm::_ref<atomic_t<u128>>(rsx->label_addr + 0x10).store(u128{});
 	}
 
 	void user_command(thread* rsx, u32, u32 arg)
@@ -1680,12 +1805,12 @@ namespace rsx
 			return;
 		}
 
-		if (rsx->user_handler)
+		if (auto ptr = rsx->user_handler)
 		{
 			rsx->intr_thread->cmd_list
 			({
 				{ ppu_cmd::set_args, 1 }, u64{arg},
-				{ ppu_cmd::lle_call, rsx->user_handler },
+				{ ppu_cmd::lle_call, ptr },
 				{ ppu_cmd::sleep, 0 }
 			});
 
@@ -1699,7 +1824,7 @@ namespace rsx
 		template<u32 index>
 		struct driver_flip
 		{
-			static void impl(thread* /*rsx*/, u32 /*reg*/, u32 arg)
+			static void impl(thread*, u32 /*reg*/, u32 arg)
 			{
 				sys_rsx_context_attribute(0x55555555, 0x102, index, arg, 0, 0);
 			}
@@ -1708,7 +1833,7 @@ namespace rsx
 		template<u32 index>
 		struct queue_flip
 		{
-			static void impl(thread* /*rsx*/, u32 /*reg*/, u32 arg)
+			static void impl(thread*, u32 /*reg*/, u32 arg)
 			{
 				sys_rsx_context_attribute(0x55555555, 0x103, index, arg, 0, 0);
 			}
@@ -1755,7 +1880,6 @@ namespace rsx
 		registers[NV406E_SET_CONTEXT_DMA_SEMAPHORE] = CELL_GCM_CONTEXT_DMA_SEMAPHORE_R;
 		registers[NV4097_SET_CONTEXT_DMA_SEMAPHORE] = CELL_GCM_CONTEXT_DMA_SEMAPHORE_RW;
 
-		if (get_current_renderer()->isHLE)
 		{
 			// Commands injected by cellGcmInit
 			registers[NV406E_SEMAPHORE_OFFSET] = 0x30;
@@ -2287,7 +2411,8 @@ namespace rsx
 			registers[NV308A_POINT] = 0x0;
 			registers[NV308A_SIZE_OUT] = 0x0;
 			registers[NV308A_SIZE_IN] = 0x0;
-			registers[NV406E_SET_REFERENCE] = get_current_renderer()->ctrl->ref = 0xffffffff;
+			registers[NV406E_SET_REFERENCE] = umax;
+			if (auto rsx = Emu.IsStopped() ? nullptr : get_current_renderer(); rsx && rsx->ctrl) rsx->ctrl->ref = u32{umax};
 		}
 	}
 
@@ -2833,25 +2958,6 @@ namespace rsx
 
 			bind_range_impl_t<Id, Step, Count, T, Index>::impl();
 		}
-
-		template<u32 Id, rsx_method_t Func>
-		static void bind()
-		{
-			static_assert(Id < 0x10000 / 4);
-
-			methods[Id] = Func;
-		}
-
-		template <u32 Id, u32 Step, u32 Count, rsx_method_t Func>
-		static void bind_array()
-		{
-			static_assert(Step && Count && Id + u64{Step} * (Count - 1) < 0x10000 / 4);
-
-			for (u32 i = Id; i < Id + Count * Step; i += Step)
-			{
-				methods[i] = Func;
-			}
-		}
 	}
 
 	// TODO: implement this as virtual function: rsx::thread::init_methods() or something
@@ -2861,6 +2967,21 @@ namespace rsx
 		using namespace method_detail;
 
 		methods.fill(&invalid_method);
+
+		auto bind = [](u32 id, rsx_method_t func)
+		{
+			methods.at(id) = func;
+		};
+
+		auto bind_array = [](u32 id, u32 step, u32 count, rsx_method_t func)
+		{
+			ensure(step && count && id + u64{step} * (count - 1) < 0x10000 / 4);
+
+			for (u32 i = id; i < id + count * step; i += step)
+			{
+				methods[i] = func;
+			}
+		};
 
 		// NV40_CHANNEL_DMA (NV406E)
 		methods[NV406E_SET_REFERENCE]                     = nullptr;
@@ -3113,6 +3234,7 @@ namespace rsx
 
 		// NV03_MEMORY_TO_MEMORY_FORMAT	(NV0039)
 		methods[NV0039_SET_OBJECT]                        = nullptr;
+		bind(0x2100 >> 2, trace_method);
 		methods[NV0039_SET_CONTEXT_DMA_NOTIFIES]          = nullptr;
 		methods[NV0039_SET_CONTEXT_DMA_BUFFER_IN]         = nullptr;
 		methods[NV0039_SET_CONTEXT_DMA_BUFFER_OUT]        = nullptr;
@@ -3187,50 +3309,50 @@ namespace rsx
 		methods[GCM_SET_DRIVER_OBJECT]                    = nullptr;
 		methods[FIFO::FIFO_DRAW_BARRIER >> 2]             = nullptr;
 
-		bind_array<GCM_FLIP_HEAD, 1, 2, nullptr>();
-		bind_array<GCM_DRIVER_QUEUE, 1, 8, nullptr>();
+		bind_array(GCM_FLIP_HEAD, 1, 2, nullptr);
+		bind_array(GCM_DRIVER_QUEUE, 1, 8, nullptr);
 
-		bind_array<(0x400 >> 2), 1, 0x10, nullptr>();
-		bind_array<(0x440 >> 2), 1, 0x20, nullptr>();
-		bind_array<NV4097_SET_ANISO_SPREAD, 1, 16, nullptr>();
-		bind_array<NV4097_SET_VERTEX_TEXTURE_OFFSET, 1, 8 * 4, nullptr>();
-		bind_array<NV4097_SET_VERTEX_DATA_SCALED4S_M, 1, 32, nullptr>();
-		bind_array<NV4097_SET_TEXTURE_CONTROL2, 1, 16, nullptr>();
-		bind_array<NV4097_SET_TEX_COORD_CONTROL, 1, 10, nullptr>();
-		bind_array<NV4097_SET_TRANSFORM_PROGRAM, 1, 32, nullptr>();
-		bind_array<NV4097_SET_POLYGON_STIPPLE_PATTERN, 1, 32, nullptr>();
-		bind_array<NV4097_SET_VERTEX_DATA3F_M, 1, 64, nullptr>();
-		bind_array<NV4097_SET_VERTEX_DATA_ARRAY_OFFSET, 1, 16, nullptr>();
-		bind_array<NV4097_SET_VERTEX_DATA_ARRAY_FORMAT, 1, 16, nullptr>();
-		bind_array<NV4097_SET_TEXTURE_CONTROL3, 1, 16, nullptr>();
-		bind_array<NV4097_SET_VERTEX_DATA2F_M, 1, 32, nullptr>();
-		bind_array<NV4097_SET_VERTEX_DATA2S_M, 1, 16, nullptr>();
-		bind_array<NV4097_SET_VERTEX_DATA4UB_M, 1, 16, nullptr>();
-		bind_array<NV4097_SET_VERTEX_DATA4S_M, 1, 32, nullptr>();
-		bind_array<NV4097_SET_TEXTURE_OFFSET, 1, 8 * 16, nullptr>();
-		bind_array<NV4097_SET_VERTEX_DATA4F_M, 1, 64, nullptr>();
-		bind_array<NV4097_SET_VERTEX_DATA1F_M, 1, 16, nullptr>();
-		bind_array<NV4097_SET_COLOR_KEY_COLOR, 1, 16, nullptr>();
+		bind_array(0x400 >> 2, 1, 0x10, nullptr);
+		bind_array(0x440 >> 2, 1, 0x20, nullptr);
+		bind_array(NV4097_SET_ANISO_SPREAD, 1, 16, nullptr);
+		bind_array(NV4097_SET_VERTEX_TEXTURE_OFFSET, 1, 8 * 4, nullptr);
+		bind_array(NV4097_SET_VERTEX_DATA_SCALED4S_M, 1, 32, nullptr);
+		bind_array(NV4097_SET_TEXTURE_CONTROL2, 1, 16, nullptr);
+		bind_array(NV4097_SET_TEX_COORD_CONTROL, 1, 10, nullptr);
+		bind_array(NV4097_SET_TRANSFORM_PROGRAM, 1, 32, nullptr);
+		bind_array(NV4097_SET_POLYGON_STIPPLE_PATTERN, 1, 32, nullptr);
+		bind_array(NV4097_SET_VERTEX_DATA3F_M, 1, 64, nullptr);
+		bind_array(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET, 1, 16, nullptr);
+		bind_array(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT, 1, 16, nullptr);
+		bind_array(NV4097_SET_TEXTURE_CONTROL3, 1, 16, nullptr);
+		bind_array(NV4097_SET_VERTEX_DATA2F_M, 1, 32, nullptr);
+		bind_array(NV4097_SET_VERTEX_DATA2S_M, 1, 16, nullptr);
+		bind_array(NV4097_SET_VERTEX_DATA4UB_M, 1, 16, nullptr);
+		bind_array(NV4097_SET_VERTEX_DATA4S_M, 1, 32, nullptr);
+		bind_array(NV4097_SET_TEXTURE_OFFSET, 1, 8 * 16, nullptr);
+		bind_array(NV4097_SET_VERTEX_DATA4F_M, 1, 64, nullptr);
+		bind_array(NV4097_SET_VERTEX_DATA1F_M, 1, 16, nullptr);
+		bind_array(NV4097_SET_COLOR_KEY_COLOR, 1, 16, nullptr);
 
 		// Unknown (NV4097?)
-		bind<(0x171c >> 2), trace_method>();
+		bind(0x171c >> 2, trace_method);
 
 		// NV406E
-		bind<NV406E_SET_REFERENCE, nv406e::set_reference>();
-		bind<NV406E_SEMAPHORE_ACQUIRE, nv406e::semaphore_acquire>();
-		bind<NV406E_SEMAPHORE_RELEASE, nv406e::semaphore_release>();
+		bind(NV406E_SET_REFERENCE, nv406e::set_reference);
+		bind(NV406E_SEMAPHORE_ACQUIRE, nv406e::semaphore_acquire);
+		bind(NV406E_SEMAPHORE_RELEASE, nv406e::semaphore_release);
 
 		// NV4097
-		bind<NV4097_SET_CULL_FACE, nv4097::set_cull_face>();
-		bind<NV4097_TEXTURE_READ_SEMAPHORE_RELEASE, nv4097::texture_read_semaphore_release>();
-		bind<NV4097_BACK_END_WRITE_SEMAPHORE_RELEASE, nv4097::back_end_write_semaphore_release>();
-		bind<NV4097_SET_BEGIN_END, nv4097::set_begin_end>();
-		bind<NV4097_CLEAR_SURFACE, nv4097::clear>();
-		bind<NV4097_DRAW_ARRAYS, nv4097::draw_arrays>();
-		bind<NV4097_DRAW_INDEX_ARRAY, nv4097::draw_index_array>();
-		bind<NV4097_INLINE_ARRAY, nv4097::draw_inline_array>();
-		bind<NV4097_ARRAY_ELEMENT16, nv4097::set_array_element16>();
-		bind<NV4097_ARRAY_ELEMENT32, nv4097::set_array_element32>();
+		bind(NV4097_SET_CULL_FACE, nv4097::set_cull_face);
+		bind(NV4097_TEXTURE_READ_SEMAPHORE_RELEASE, nv4097::texture_read_semaphore_release);
+		bind(NV4097_BACK_END_WRITE_SEMAPHORE_RELEASE, nv4097::back_end_write_semaphore_release);
+		bind(NV4097_SET_BEGIN_END, nv4097::set_begin_end);
+		bind(NV4097_CLEAR_SURFACE, nv4097::clear);
+		bind(NV4097_DRAW_ARRAYS, nv4097::draw_arrays);
+		bind(NV4097_DRAW_INDEX_ARRAY, nv4097::draw_index_array);
+		bind(NV4097_INLINE_ARRAY, nv4097::draw_inline_array);
+		bind(NV4097_ARRAY_ELEMENT16, nv4097::set_array_element16);
+		bind(NV4097_ARRAY_ELEMENT32, nv4097::set_array_element32);
 		bind_range<NV4097_SET_VERTEX_DATA_SCALED4S_M, 1, 32, nv4097::set_vertex_data_scaled4s_m>();
 		bind_range<NV4097_SET_VERTEX_DATA4UB_M, 1, 16, nv4097::set_vertex_data4ub_m>();
 		bind_range<NV4097_SET_VERTEX_DATA1F_M, 1, 16, nv4097::set_vertex_data1f_m>();
@@ -3239,30 +3361,30 @@ namespace rsx
 		bind_range<NV4097_SET_VERTEX_DATA4F_M, 1, 64, nv4097::set_vertex_data4f_m>();
 		bind_range<NV4097_SET_VERTEX_DATA2S_M, 1, 16, nv4097::set_vertex_data2s_m>();
 		bind_range<NV4097_SET_VERTEX_DATA4S_M, 1, 32, nv4097::set_vertex_data4s_m>();
-		bind_range<NV4097_SET_TRANSFORM_CONSTANT, 1, 32, nv4097::set_transform_constant>();
-		bind_range<NV4097_SET_TRANSFORM_PROGRAM, 1, 32, nv4097::set_transform_program>();
-		bind<NV4097_GET_REPORT, nv4097::get_report>();
-		bind<NV4097_CLEAR_REPORT_VALUE, nv4097::clear_report_value>();
-		bind<NV4097_SET_SURFACE_CLIP_HORIZONTAL, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_SURFACE_CLIP_VERTICAL, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_SURFACE_COLOR_AOFFSET, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_SURFACE_COLOR_BOFFSET, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_SURFACE_COLOR_COFFSET, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_SURFACE_COLOR_DOFFSET, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_SURFACE_ZETA_OFFSET, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_CONTEXT_DMA_COLOR_A, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_CONTEXT_DMA_COLOR_B, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_CONTEXT_DMA_COLOR_C, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_CONTEXT_DMA_COLOR_D, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_CONTEXT_DMA_ZETA, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_NOTIFY, nv4097::set_notify>();
-		bind<NV4097_SET_SURFACE_FORMAT, nv4097::set_surface_format>();
-		bind<NV4097_SET_SURFACE_PITCH_A, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_SURFACE_PITCH_B, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_SURFACE_PITCH_C, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_SURFACE_PITCH_D, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_SURFACE_PITCH_Z, nv4097::set_surface_dirty_bit>();
-		bind<NV4097_SET_WINDOW_OFFSET, nv4097::set_surface_dirty_bit>();
+		bind_array(NV4097_SET_TRANSFORM_CONSTANT, 1, 32, nv4097::set_transform_constant::impl);
+		bind_array(NV4097_SET_TRANSFORM_PROGRAM, 1, 32, nv4097::set_transform_program::impl);
+		bind(NV4097_GET_REPORT, nv4097::get_report);
+		bind(NV4097_CLEAR_REPORT_VALUE, nv4097::clear_report_value);
+		bind(NV4097_SET_SURFACE_CLIP_HORIZONTAL, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_SURFACE_CLIP_VERTICAL, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_SURFACE_COLOR_AOFFSET, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_SURFACE_COLOR_BOFFSET, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_SURFACE_COLOR_COFFSET, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_SURFACE_COLOR_DOFFSET, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_SURFACE_ZETA_OFFSET, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_CONTEXT_DMA_COLOR_A, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_CONTEXT_DMA_COLOR_B, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_CONTEXT_DMA_COLOR_C, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_CONTEXT_DMA_COLOR_D, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_CONTEXT_DMA_ZETA, nv4097::set_surface_dirty_bit);
+		bind(NV4097_NOTIFY, nv4097::set_notify);
+		bind(NV4097_SET_SURFACE_FORMAT, nv4097::set_surface_format);
+		bind(NV4097_SET_SURFACE_PITCH_A, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_SURFACE_PITCH_B, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_SURFACE_PITCH_C, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_SURFACE_PITCH_D, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_SURFACE_PITCH_Z, nv4097::set_surface_dirty_bit);
+		bind(NV4097_SET_WINDOW_OFFSET, nv4097::set_surface_dirty_bit);
 		bind_range<NV4097_SET_TEXTURE_OFFSET, 8, 16, nv4097::set_texture_dirty_bit>();
 		bind_range<NV4097_SET_TEXTURE_FORMAT, 8, 16, nv4097::set_texture_dirty_bit>();
 		bind_range<NV4097_SET_TEXTURE_ADDRESS, 8, 16, nv4097::set_texture_dirty_bit>();
@@ -3281,90 +3403,86 @@ namespace rsx
 		bind_range<NV4097_SET_VERTEX_TEXTURE_FILTER, 8, 4, nv4097::set_vertex_texture_dirty_bit>();
 		bind_range<NV4097_SET_VERTEX_TEXTURE_IMAGE_RECT, 8, 4, nv4097::set_vertex_texture_dirty_bit>();
 		bind_range<NV4097_SET_VERTEX_TEXTURE_BORDER_COLOR, 8, 4, nv4097::set_vertex_texture_dirty_bit>();
-		bind<NV4097_SET_RENDER_ENABLE, nv4097::set_render_mode>();
-		bind<NV4097_SET_ZCULL_EN, nv4097::set_zcull_render_enable>();
-		bind<NV4097_SET_ZCULL_STATS_ENABLE, nv4097::set_zcull_stats_enable>();
-		bind<NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, nv4097::set_zcull_pixel_count_enable>();
-		bind<NV4097_CLEAR_ZCULL_SURFACE, nv4097::clear_zcull>();
-		bind<NV4097_SET_DEPTH_TEST_ENABLE, nv4097::set_surface_options_dirty_bit>();
-		bind<NV4097_SET_DEPTH_FUNC, nv4097::set_surface_options_dirty_bit>();
-		bind<NV4097_SET_STENCIL_TEST_ENABLE, nv4097::set_surface_options_dirty_bit>();
-		bind<NV4097_SET_DEPTH_MASK, nv4097::set_surface_options_dirty_bit>();
-		bind<NV4097_SET_COLOR_MASK, nv4097::set_surface_options_dirty_bit>();
-		bind<NV4097_SET_COLOR_MASK_MRT, nv4097::set_surface_options_dirty_bit>();
-		bind<NV4097_SET_TWO_SIDED_STENCIL_TEST_ENABLE, nv4097::set_surface_options_dirty_bit>();
-		bind<NV4097_SET_STENCIL_TEST_ENABLE, nv4097::set_surface_options_dirty_bit>();
-		bind<NV4097_SET_STENCIL_MASK, nv4097::set_surface_options_dirty_bit>();
-		bind<NV4097_SET_STENCIL_OP_ZPASS, nv4097::set_stencil_op>();
-		bind<NV4097_SET_STENCIL_OP_FAIL, nv4097::set_stencil_op>();
-		bind<NV4097_SET_STENCIL_OP_ZFAIL, nv4097::set_stencil_op>();
-		bind<NV4097_SET_BACK_STENCIL_MASK, nv4097::set_surface_options_dirty_bit>();
-		bind<NV4097_SET_BACK_STENCIL_OP_ZPASS, nv4097::set_stencil_op>();
-		bind<NV4097_SET_BACK_STENCIL_OP_FAIL, nv4097::set_stencil_op>();
-		bind<NV4097_SET_BACK_STENCIL_OP_ZFAIL, nv4097::set_stencil_op>();
-		bind<NV4097_WAIT_FOR_IDLE, nv4097::sync>();
-		bind<NV4097_INVALIDATE_L2, nv4097::set_shader_program_dirty>();
-		bind<NV4097_SET_SHADER_PROGRAM, nv4097::set_shader_program_dirty>();
-		bind<NV4097_SET_SHADER_CONTROL, nv4097::notify_state_changed<fragment_program_state_dirty>>();
-		bind_array<NV4097_SET_TEX_COORD_CONTROL, 1, 10, nv4097::notify_state_changed<fragment_program_state_dirty>>();
-		bind<NV4097_SET_TWO_SIDE_LIGHT_EN, nv4097::notify_state_changed<fragment_program_state_dirty>>();
-		bind<NV4097_SET_POINT_SPRITE_CONTROL, nv4097::notify_state_changed<fragment_program_state_dirty>>();
-		bind<NV4097_SET_TRANSFORM_PROGRAM_START, nv4097::set_transform_program_start>();
-		bind<NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK, nv4097::set_vertex_attribute_output_mask>();
-		bind<NV4097_SET_VERTEX_DATA_BASE_OFFSET, nv4097::set_vertex_base_offset>();
-		bind<NV4097_SET_VERTEX_DATA_BASE_INDEX, nv4097::set_index_base_offset>();
+		bind(NV4097_SET_RENDER_ENABLE, nv4097::set_render_mode);
+		bind(NV4097_SET_ZCULL_EN, nv4097::set_zcull_render_enable);
+		bind(NV4097_SET_ZCULL_STATS_ENABLE, nv4097::set_zcull_stats_enable);
+		bind(NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, nv4097::set_zcull_pixel_count_enable);
+		bind(NV4097_CLEAR_ZCULL_SURFACE, nv4097::clear_zcull);
+		bind(NV4097_SET_DEPTH_TEST_ENABLE, nv4097::set_surface_options_dirty_bit);
+		bind(NV4097_SET_DEPTH_FUNC, nv4097::set_surface_options_dirty_bit);
+		bind(NV4097_SET_STENCIL_TEST_ENABLE, nv4097::set_surface_options_dirty_bit);
+		bind(NV4097_SET_DEPTH_MASK, nv4097::set_surface_options_dirty_bit);
+		bind(NV4097_SET_COLOR_MASK, nv4097::set_surface_options_dirty_bit);
+		bind(NV4097_SET_COLOR_MASK_MRT, nv4097::set_surface_options_dirty_bit);
+		bind(NV4097_SET_TWO_SIDED_STENCIL_TEST_ENABLE, nv4097::set_surface_options_dirty_bit);
+		bind(NV4097_SET_STENCIL_TEST_ENABLE, nv4097::set_surface_options_dirty_bit);
+		bind(NV4097_SET_STENCIL_MASK, nv4097::set_surface_options_dirty_bit);
+		bind(NV4097_SET_STENCIL_OP_ZPASS, nv4097::set_stencil_op);
+		bind(NV4097_SET_STENCIL_OP_FAIL, nv4097::set_stencil_op);
+		bind(NV4097_SET_STENCIL_OP_ZFAIL, nv4097::set_stencil_op);
+		bind(NV4097_SET_BACK_STENCIL_MASK, nv4097::set_surface_options_dirty_bit);
+		bind(NV4097_SET_BACK_STENCIL_OP_ZPASS, nv4097::set_stencil_op);
+		bind(NV4097_SET_BACK_STENCIL_OP_FAIL, nv4097::set_stencil_op);
+		bind(NV4097_SET_BACK_STENCIL_OP_ZFAIL, nv4097::set_stencil_op);
+		bind(NV4097_WAIT_FOR_IDLE, nv4097::sync);
+		bind(NV4097_INVALIDATE_L2, nv4097::set_shader_program_dirty);
+		bind(NV4097_SET_SHADER_PROGRAM, nv4097::set_shader_program_dirty);
+		bind(NV4097_SET_SHADER_CONTROL, nv4097::notify_state_changed<fragment_program_state_dirty>);
+		bind_array(NV4097_SET_TEX_COORD_CONTROL, 1, 10, nv4097::notify_state_changed<fragment_program_state_dirty>);
+		bind(NV4097_SET_TWO_SIDE_LIGHT_EN, nv4097::notify_state_changed<fragment_program_state_dirty>);
+		bind(NV4097_SET_POINT_SPRITE_CONTROL, nv4097::notify_state_changed<fragment_program_state_dirty>);
+		bind(NV4097_SET_TRANSFORM_PROGRAM_START, nv4097::set_transform_program_start);
+		bind(NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK, nv4097::set_vertex_attribute_output_mask);
+		bind(NV4097_SET_VERTEX_DATA_BASE_OFFSET, nv4097::set_vertex_base_offset);
+		bind(NV4097_SET_VERTEX_DATA_BASE_INDEX, nv4097::set_index_base_offset);
 		bind_range<NV4097_SET_VERTEX_DATA_ARRAY_OFFSET, 1, 16, nv4097::set_vertex_array_offset>();
-		bind<NV4097_SET_USER_CLIP_PLANE_CONTROL, nv4097::notify_state_changed<vertex_state_dirty>>();
-		bind<NV4097_SET_TRANSFORM_BRANCH_BITS, nv4097::notify_state_changed<vertex_state_dirty>>();
-		bind<NV4097_SET_CLIP_MIN, nv4097::notify_state_changed<invalidate_zclip_bits>>();
-		bind<NV4097_SET_CLIP_MAX, nv4097::notify_state_changed<invalidate_zclip_bits>>();
-		bind<NV4097_SET_POINT_SIZE, nv4097::notify_state_changed<vertex_state_dirty>>();
-		bind<NV4097_SET_ALPHA_FUNC, nv4097::notify_state_changed<fragment_state_dirty>>();
-		bind<NV4097_SET_ALPHA_REF, nv4097::notify_state_changed<fragment_state_dirty>>();
-		bind<NV4097_SET_ALPHA_TEST_ENABLE, nv4097::notify_state_changed<fragment_state_dirty>>();
-		bind<NV4097_SET_ANTI_ALIASING_CONTROL, nv4097::notify_state_changed<fragment_state_dirty>>();
-		bind<NV4097_SET_SHADER_PACKER, nv4097::notify_state_changed<fragment_state_dirty>>();
-		bind<NV4097_SET_SHADER_WINDOW, nv4097::notify_state_changed<fragment_state_dirty>>();
-		bind<NV4097_SET_FOG_MODE, nv4097::notify_state_changed<fragment_state_dirty>>();
-		bind<NV4097_SET_SCISSOR_HORIZONTAL, nv4097::notify_state_changed<scissor_config_state_dirty>>();
-		bind<NV4097_SET_SCISSOR_VERTICAL, nv4097::notify_state_changed<scissor_config_state_dirty>>();
-		bind<NV4097_SET_VIEWPORT_HORIZONTAL, nv4097::notify_state_changed<scissor_config_state_dirty>>();
-		bind<NV4097_SET_VIEWPORT_VERTICAL, nv4097::notify_state_changed<scissor_config_state_dirty>>();
-		bind_array<NV4097_SET_FOG_PARAMS, 1, 2, nv4097::notify_state_changed<fragment_state_dirty>>();
-		bind_array<NV4097_SET_VIEWPORT_SCALE, 1, 3, nv4097::notify_state_changed<vertex_state_dirty>>();
-		bind_array<NV4097_SET_VIEWPORT_OFFSET, 1, 3, nv4097::notify_state_changed<vertex_state_dirty>>();
-		bind<NV4097_SET_INDEX_ARRAY_DMA, nv4097::check_index_array_dma>();
-		bind<NV4097_SET_BLEND_EQUATION, nv4097::set_blend_equation>();
-		bind<NV4097_SET_BLEND_FUNC_SFACTOR, nv4097::set_blend_factor>();
-		bind<NV4097_SET_BLEND_FUNC_DFACTOR, nv4097::set_blend_factor>();
-		bind<NV4097_SET_POLYGON_STIPPLE, nv4097::notify_state_changed<fragment_state_dirty>>();
-		bind_array<NV4097_SET_POLYGON_STIPPLE_PATTERN, 1, 32, nv4097::notify_state_changed<polygon_stipple_pattern_dirty>>();
+		bind(NV4097_SET_USER_CLIP_PLANE_CONTROL, nv4097::notify_state_changed<vertex_state_dirty>);
+		bind(NV4097_SET_TRANSFORM_BRANCH_BITS, nv4097::notify_state_changed<vertex_state_dirty>);
+		bind(NV4097_SET_CLIP_MIN, nv4097::notify_state_changed<invalidate_zclip_bits>);
+		bind(NV4097_SET_CLIP_MAX, nv4097::notify_state_changed<invalidate_zclip_bits>);
+		bind(NV4097_SET_POINT_SIZE, nv4097::notify_state_changed<vertex_state_dirty>);
+		bind(NV4097_SET_ALPHA_FUNC, nv4097::notify_state_changed<fragment_state_dirty>);
+		bind(NV4097_SET_ALPHA_REF, nv4097::notify_state_changed<fragment_state_dirty>);
+		bind(NV4097_SET_ALPHA_TEST_ENABLE, nv4097::notify_state_changed<fragment_state_dirty>);
+		bind(NV4097_SET_ANTI_ALIASING_CONTROL, nv4097::notify_state_changed<fragment_state_dirty>);
+		bind(NV4097_SET_SHADER_PACKER, nv4097::notify_state_changed<fragment_state_dirty>);
+		bind(NV4097_SET_SHADER_WINDOW, nv4097::notify_state_changed<fragment_state_dirty>);
+		bind(NV4097_SET_FOG_MODE, nv4097::notify_state_changed<fragment_state_dirty>);
+		bind(NV4097_SET_SCISSOR_HORIZONTAL, nv4097::notify_state_changed<scissor_config_state_dirty>);
+		bind(NV4097_SET_SCISSOR_VERTICAL, nv4097::notify_state_changed<scissor_config_state_dirty>);
+		bind(NV4097_SET_VIEWPORT_HORIZONTAL, nv4097::notify_state_changed<scissor_config_state_dirty>);
+		bind(NV4097_SET_VIEWPORT_VERTICAL, nv4097::notify_state_changed<scissor_config_state_dirty>);
+		bind_array(NV4097_SET_FOG_PARAMS, 1, 2, nv4097::notify_state_changed<fragment_state_dirty>);
+		bind_array(NV4097_SET_VIEWPORT_SCALE, 1, 3, nv4097::notify_state_changed<vertex_state_dirty>);
+		bind_array(NV4097_SET_VIEWPORT_OFFSET, 1, 3, nv4097::notify_state_changed<vertex_state_dirty>);
+		bind(NV4097_SET_INDEX_ARRAY_DMA, nv4097::check_index_array_dma);
+		bind(NV4097_SET_BLEND_EQUATION, nv4097::set_blend_equation);
+		bind(NV4097_SET_BLEND_FUNC_SFACTOR, nv4097::set_blend_factor);
+		bind(NV4097_SET_BLEND_FUNC_DFACTOR, nv4097::set_blend_factor);
+		bind(NV4097_SET_POLYGON_STIPPLE, nv4097::notify_state_changed<fragment_state_dirty>);
+		bind_array(NV4097_SET_POLYGON_STIPPLE_PATTERN, 1, 32, nv4097::notify_state_changed<polygon_stipple_pattern_dirty>);
 
 		//NV308A (0xa400..0xbffc!)
-		bind_range<NV308A_COLOR + (256 * 0), 1, 256, nv308a::color, 256 * 0>();
-		bind_range<NV308A_COLOR + (256 * 1), 1, 256, nv308a::color, 256 * 1>();
-		bind_range<NV308A_COLOR + (256 * 2), 1, 256, nv308a::color, 256 * 2>();
-		bind_range<NV308A_COLOR + (256 * 3), 1, 256, nv308a::color, 256 * 3>();
-		bind_range<NV308A_COLOR + (256 * 4), 1, 256, nv308a::color, 256 * 4>();
-		bind_range<NV308A_COLOR + (256 * 5), 1, 256, nv308a::color, 256 * 5>();
-		bind_range<NV308A_COLOR + (256 * 6), 1, 256, nv308a::color, 256 * 6>();
+		bind_array(NV308A_COLOR, 1, 256 * 7, nv308a::color::impl);
 
 		//NV3089
-		bind<NV3089_IMAGE_IN, nv3089::image_in>();
+		bind(NV3089_IMAGE_IN, nv3089::image_in);
 
 		//NV0039
-		bind<NV0039_BUFFER_NOTIFY, nv0039::buffer_notify>();
+		bind(NV0039_BUFFER_NOTIFY, nv0039::buffer_notify);
 
 		// lv1 hypervisor
-		bind_array<GCM_SET_USER_COMMAND, 1, 2, user_command>();
+		bind_array(GCM_SET_USER_COMMAND, 1, 2, user_command);
 		bind_range<GCM_FLIP_HEAD, 1, 2, gcm::driver_flip>();
 		bind_range<GCM_DRIVER_QUEUE, 1, 8, gcm::queue_flip>();
 
 		// custom methods
-		bind<GCM_FLIP_COMMAND, flip_command>();
+		bind(GCM_FLIP_COMMAND, flip_command);
 
 		// FIFO
-		bind<(FIFO::FIFO_DRAW_BARRIER >> 2), fifo::draw_barrier>();
+		bind(FIFO::FIFO_DRAW_BARRIER >> 2, fifo::draw_barrier);
+
+		method_registers.init();
 
 		return true;
 	}();

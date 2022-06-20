@@ -5,15 +5,23 @@
 #include <thread>
 #include <semaphore>
 #include "Utilities/mutex.h"
+#include "Emu/localized_string.h"
 
 #include "util/asm.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
 #else
+#ifdef __clang__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wold-style-cast"
+#endif
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#ifdef __clang__
+#pragma GCC diagnostic pop
+#endif
 #endif
 
 #include "Emu/Cell/Modules/sceNp.h"
@@ -211,6 +219,9 @@ namespace rpcn
 		std::set<std::string> blocked;
 	};
 
+	localized_string_id rpcn_state_to_localized_string_id(rpcn::rpcn_state state);
+	std::string rpcn_state_to_string(rpcn::rpcn_state state);
+
 	class rpcn_client
 	{
 	private:
@@ -337,7 +348,7 @@ namespace rpcn
 		bool ping_room_owner(u32 req_id, const SceNpCommunicationId& communication_id, u64 room_id);
 		bool send_room_message(u32 req_id, const SceNpCommunicationId& communication_id, const SceNpMatching2SendRoomMessageRequest* req);
 		bool req_sign_infos(u32 req_id, const std::string& npid);
-		bool req_ticket(u32 req_id, const std::string& service_id);
+		bool req_ticket(u32 req_id, const std::string& service_id, const std::vector<u8>& cookie);
 		bool sendmessage(const message_data& msg_data, const std::set<std::string>& npids);
 
 		const std::string& get_online_name() const

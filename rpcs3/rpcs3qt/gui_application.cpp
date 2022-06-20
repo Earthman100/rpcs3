@@ -11,13 +11,17 @@
 #include "display_sleep_control.h"
 #include "localized_emu.h"
 #include "qt_camera_handler.h"
+#include "qt_music_handler.h"
 
 #ifdef WITH_DISCORD_RPC
 #include "_discord_utils.h"
 #endif
 
 #include "Emu/Io/Null/null_camera_handler.h"
+#include "Emu/Io/Null/null_music_handler.h"
 #include "Emu/Cell/Modules/cellAudio.h"
+#include "Emu/Cell/lv2/sys_rsxaudio.h"
+#include "Emu/Cell/lv2/sys_process.h"
 #include "Emu/RSX/Overlays/overlay_perf_metrics.h"
 #include "Emu/system_utils.hpp"
 #include "Emu/vfs_config.h"
@@ -35,6 +39,7 @@
 #include <QDirIterator>
 #include <QFileInfo>
 #include <QSound>
+#include <QMessageBox>
 
 #include <clocale>
 
@@ -60,7 +65,9 @@ gui_application::~gui_application()
 
 bool gui_application::Init()
 {
+#ifndef __APPLE__
 	setWindowIcon(QIcon(":/rpcs3.ico"));
+#endif
 
 	m_emu_settings.reset(new emu_settings());
 	m_gui_settings.reset(new gui_settings());
@@ -103,6 +110,17 @@ bool gui_application::Init()
 	{
 		welcome_dialog* welcome = new welcome_dialog(m_gui_settings);
 		welcome->exec();
+	}
+
+	// Check maxfiles
+	if (utils::get_maxfiles() < 4096)
+	{
+		QMessageBox::warning(nullptr,
+							 tr("Warning"),
+							 tr("The current limit of maximum file descriptors is too low.\n"
+								"Some games will crash.\n"
+								"\n"
+								"Please increase the limit before running RPCS3."));
 	}
 
 	if (m_main_window && !m_main_window->Init(m_with_cli_boot))
@@ -250,7 +268,7 @@ void gui_application::InitializeConnects()
 #endif
 
 	qRegisterMetaType<std::function<void()>>("std::function<void()>");
-	connect(this, &gui_application::RequestCallAfter, this, &gui_application::HandleCallAfter);
+	connect(this, &gui_application::RequestCallFromMainThread, this, &gui_application::CallFromMainThread);
 }
 
 std::unique_ptr<gs_frame> gui_application::get_gs_frame()
@@ -318,9 +336,9 @@ void gui_application::InitializeCallbacks()
 
 		return false;
 	};
-	callbacks.call_after = [this](std::function<void()> func)
+	callbacks.call_from_main_thread = [this](std::function<void()> func)
 	{
-		RequestCallAfter(std::move(func));
+		RequestCallFromMainThread(std::move(func));
 	};
 
 	callbacks.init_gs_render = []()
@@ -334,16 +352,18 @@ void gui_application::InitializeCallbacks()
 		}
 		case video_renderer::opengl:
 		{
+#if not defined(__APPLE__)
 			g_fxo->init<rsx::thread, named_thread<GLGSRender>>();
+#endif
 			break;
 		}
-#if defined(HAVE_VULKAN)
 		case video_renderer::vulkan:
 		{
+#if defined(HAVE_VULKAN)
 			g_fxo->init<rsx::thread, named_thread<VKGSRender>>();
+#endif
 			break;
 		}
-#endif
 		}
 	};
 
@@ -363,6 +383,23 @@ void gui_application::InitializeCallbacks()
 		}
 		return nullptr;
 	};
+
+	callbacks.get_music_handler = []() -> std::shared_ptr<music_handler_base>
+	{
+		switch (g_cfg.audio.music.get())
+		{
+		case music_handler::null:
+		{
+			return std::make_shared<null_music_handler>();
+		}
+		case music_handler::qt:
+		{
+			return std::make_shared<qt_music_handler>();
+		}
+		}
+		return nullptr;
+	};
+
 	callbacks.get_gs_frame    = [this]() -> std::unique_ptr<GSFrameBase> { return get_gs_frame(); };
 	callbacks.get_msg_dialog  = [this]() -> std::shared_ptr<MsgDialogBase> { return m_show_gui ? std::make_shared<msg_dialog_frame>() : nullptr; };
 	callbacks.get_osk_dialog  = [this]() -> std::shared_ptr<OskDialogBase> { return m_show_gui ? std::make_shared<osk_dialog_frame>() : nullptr; };
@@ -410,7 +447,7 @@ void gui_application::InitializeCallbacks()
 
 	callbacks.play_sound = [](const std::string& path)
 	{
-		Emu.CallAfter([path]()
+		Emu.CallFromMainThread([path]()
 		{
 			if (fs::is_file(path))
 			{
@@ -435,7 +472,7 @@ void gui_application::StartPlaytime(bool start_playtime = true)
 		return;
 	}
 
-	m_persistent_settings->SetLastPlayed(serial, QDate::currentDate().toString(gui::persistent::last_played_date_format));
+	m_persistent_settings->SetLastPlayed(serial, QDateTime::currentDateTime().toString(gui::persistent::last_played_date_format));
 	m_timer_playtime.start();
 	m_timer.start(10000); // Update every 10 seconds in case the emulation crashes
 }
@@ -457,7 +494,7 @@ void gui_application::UpdatePlaytime()
 	}
 
 	m_persistent_settings->AddPlaytime(serial, m_timer_playtime.restart());
-	m_persistent_settings->SetLastPlayed(serial, QDate::currentDate().toString(gui::persistent::last_played_date_format));
+	m_persistent_settings->SetLastPlayed(serial, QDateTime::currentDateTime().toString(gui::persistent::last_played_date_format));
 }
 
 void gui_application::StopPlaytime()
@@ -475,7 +512,7 @@ void gui_application::StopPlaytime()
 	}
 
 	m_persistent_settings->AddPlaytime(serial, m_timer_playtime.restart());
-	m_persistent_settings->SetLastPlayed(serial, QDate::currentDate().toString(gui::persistent::last_played_date_format));
+	m_persistent_settings->SetLastPlayed(serial, QDateTime::currentDateTime().toString(gui::persistent::last_played_date_format));
 	m_timer_playtime.invalidate();
 }
 
@@ -593,14 +630,29 @@ void gui_application::OnEmuSettingsChange()
 	}
 
 	rpcs3::utils::configure_logs();
+
+	if (!Emu.IsStopped())
+	{
+		// Force audio provider
+		if (g_ps3_process_info.get_cellos_appname() == "vsh.self"sv)
+		{
+			g_cfg.audio.provider.set(audio_provider::rsxaudio);
+		}
+		else
+		{
+			g_cfg.audio.provider.set(audio_provider::cell_audio);
+		}
+	}
+
 	audio::configure_audio();
+	audio::configure_rsxaudio();
 	rsx::overlays::reset_performance_overlay();
 }
 
 /**
  * Using connects avoids timers being unable to be used in a non-qt thread. So, even if this looks stupid to just call func, it's succinct.
  */
-void gui_application::HandleCallAfter(const std::function<void()>& func)
+void gui_application::CallFromMainThread(const std::function<void()>& func)
 {
 	func();
 }

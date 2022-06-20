@@ -2,15 +2,15 @@
 
 enum class ppu_decoder_type : unsigned
 {
-	precise = 0, // Don't change (0)
-	fast, // Don't change (1)
+	_static,
+	dynamic,
 	llvm,
 };
 
 enum class spu_decoder_type : unsigned
 {
-	precise = 0, // Don't change (0)
-	fast, // Don't change (1)
+	_static,
+	dynamic,
 	asmjit,
 	llvm,
 };
@@ -67,12 +67,37 @@ enum class audio_provider
 	rsxaudio
 };
 
-enum class audio_downmix
+enum class audio_avport
 {
-	no_downmix, // Surround 7.1
-	downmix_to_stereo,
-	downmix_to_5_1,
-	use_application_settings
+	hdmi_0,
+	hdmi_1,
+	avmulti,
+	spdif_0,
+	spdif_1
+};
+
+enum class audio_format
+{
+	stereo,
+	surround_5_1,
+	surround_7_1,
+	automatic,
+	manual,
+};
+
+enum class audio_format_flag : unsigned
+{
+	lpcm_2_48khz   = 0x00000000, // Linear PCM 2 Ch. 48 kHz (always available)
+	lpcm_5_1_48khz = 0x00000001, // Linear PCM 5.1 Ch. 48 kHz
+	lpcm_7_1_48khz = 0x00000002, // Linear PCM 7.1 Ch. 48 kHz
+	ac3            = 0x00000004, // Dolby Digital 5.1 Ch.
+	dts            = 0x00000008, // DTS 5.1 Ch.
+};
+
+enum class music_handler
+{
+	null,
+	qt
 };
 
 enum class camera_handler
@@ -135,6 +160,12 @@ enum class microphone_handler
 	rocksmith,
 };
 
+enum class pad_handler_mode
+{
+	single_threaded, // All pad handlers run on the same thread sequentially.
+	multi_threaded   // Each pad handler has its own thread.
+};
+
 enum class video_resolution
 {
 	_1080,
@@ -161,6 +192,7 @@ enum class frame_limit_type
 	_60,
 	_30,
 	_auto,
+	_ps3,
 };
 
 enum class msaa_level
@@ -184,6 +216,14 @@ enum class screen_quadrant
 	top_right,
 	bottom_left,
 	bottom_right
+};
+
+enum class rsx_fifo_mode : unsigned
+{
+	fast,
+	atomic,
+	atomic_ordered,
+	as_ps3,
 };
 
 enum class tsx_usage
@@ -222,8 +262,8 @@ enum class shader_mode
 
 enum class vk_gpu_scheduler_mode
 {
-	host,
-	device
+	safe,
+	fast
 };
 
 enum class thread_scheduler_mode

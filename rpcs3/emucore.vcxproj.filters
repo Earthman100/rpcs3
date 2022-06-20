@@ -64,14 +64,17 @@
     <Filter Include="Emu\NP">
       <UniqueIdentifier>{652ce43e-72db-42cd-831a-0e194f67e731}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Emu\GPU\RSX\Common\Interpreter">
-      <UniqueIdentifier>{bc97b324-1eea-445a-8fa9-6fc49e3df47c}</UniqueIdentifier>
-    </Filter>
     <Filter Include="Emu\Audio\FAudio">
       <UniqueIdentifier>{7555ff6f-67a9-4d02-b744-0bf896751edb}</UniqueIdentifier>
     </Filter>
     <Filter Include="Emu\GPU\RSX\Program">
       <UniqueIdentifier>{d055ca32-157a-4d8c-895e-29509858fcb0}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Emu\GPU\RSX\Program\Snippets">
+      <UniqueIdentifier>{21667779-4136-4de4-8695-9ea13e5c9bce}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Emu\GPU\RSX\Program\Interpreter">
+      <UniqueIdentifier>{bc97b324-1eea-445a-8fa9-6fc49e3df47c}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -636,6 +639,9 @@
     <ClCompile Include="Emu\Cell\Modules\sceNpUtil.cpp">
       <Filter>Emu\Cell\Modules</Filter>
     </ClCompile>
+    <ClCompile Include="Emu\Cell\Modules\sceNpPlus.cpp">
+      <Filter>Emu\Cell\Modules</Filter>
+    </ClCompile>
     <ClCompile Include="Emu\Cell\Modules\sys_game.cpp">
       <Filter>Emu\Cell\Modules</Filter>
     </ClCompile>
@@ -762,6 +768,30 @@
     <ClCompile Include="Emu\Cell\lv2\sys_net.cpp">
       <Filter>Emu\Cell\lv2</Filter>
     </ClCompile>
+    <ClCompile Include="Emu\Cell\lv2\sys_net\lv2_socket.cpp">
+      <Filter>Emu\Cell\lv2</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\Cell\lv2\sys_net\lv2_socket_native.cpp">
+      <Filter>Emu\Cell\lv2</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\Cell\lv2\sys_net\lv2_socket_raw.cpp">
+      <Filter>Emu\Cell\lv2</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\Cell\lv2\sys_net\lv2_socket_p2p.cpp">
+      <Filter>Emu\Cell\lv2</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\Cell\lv2\sys_net\lv2_socket_p2ps.cpp">
+      <Filter>Emu\Cell\lv2</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\Cell\lv2\sys_net\network_context.cpp">
+      <Filter>Emu\Cell\lv2</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\Cell\lv2\sys_net\nt_p2p_port.cpp">
+      <Filter>Emu\Cell\lv2</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\Cell\lv2\sys_net\sys_net_helpers.cpp">
+      <Filter>Emu\Cell\lv2</Filter>
+    </ClCompile>
     <ClCompile Include="Emu\Io\PadHandler.cpp">
       <Filter>Emu\Io</Filter>
     </ClCompile>
@@ -802,6 +832,9 @@
       <Filter>Emu\Cell\lv2</Filter>
     </ClCompile>
     <ClCompile Include="Emu\RSX\Overlays\overlay_save_dialog.cpp">
+      <Filter>Emu\GPU\RSX\Overlays</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\RSX\Overlays\overlay_message.cpp">
       <Filter>Emu\GPU\RSX\Overlays</Filter>
     </ClCompile>
     <ClCompile Include="Emu\RSX\Overlays\overlay_message_dialog.cpp">
@@ -858,7 +891,7 @@
     <ClCompile Include="Emu\Io\Buzz.cpp">
       <Filter>Emu\Io</Filter>
     </ClCompile>
-	<ClCompile Include="Emu\Io\usio.cpp">
+    <ClCompile Include="Emu\Io\usio.cpp">
       <Filter>Emu\Io</Filter>
     </ClCompile>
     <ClCompile Include="Emu\Cell\lv2\sys_crypto_engine.cpp">
@@ -1024,6 +1057,27 @@
     <ClCompile Include="Emu\RSX\rsx_vertex_data.cpp">
       <Filter>Emu\GPU\RSX</Filter>
     </ClCompile>
+    <ClCompile Include="Emu\Audio\audio_resampler.cpp">
+      <Filter>Emu\Audio</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\RSX\Overlays\overlay_media_list_dialog.cpp">
+      <Filter>Emu\GPU\RSX\Overlays</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\perf_monitor.cpp">
+      <Filter>Emu</Filter>
+    </ClCompile>
+    <ClCompile Include="Crypto\decrypt_binaries.cpp">
+      <Filter>Crypto</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\RSX\RSXZCULL.cpp">
+      <Filter>Emu\GPU\RSX</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\IPC_socket.cpp">
+      <Filter>Emu</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\IPC_config.cpp">
+      <Filter>Emu</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Crypto\aes.h">
@@ -1122,7 +1176,7 @@
     <ClInclude Include="util\v128.hpp">
       <Filter>Utilities</Filter>
     </ClInclude>
-    <ClInclude Include="util\v128sse.hpp">
+    <ClInclude Include="util\simd.hpp">
       <Filter>Utilities</Filter>
     </ClInclude>
     <ClInclude Include="util\to_endian.hpp">
@@ -1542,6 +1596,9 @@
     <ClInclude Include="Emu\Cell\Modules\sceNpUtil.h">
       <Filter>Emu\Cell\Modules</Filter>
     </ClInclude>
+    <ClInclude Include="Emu\Cell\Modules\sceNpPlus.h">
+      <Filter>Emu\Cell\Modules</Filter>
+    </ClInclude>
     <ClInclude Include="Emu\Cell\Modules\sys_crashdump.h">
       <Filter>Emu\Cell\Modules</Filter>
     </ClInclude>
@@ -1818,6 +1875,9 @@
     <ClInclude Include="Emu\RSX\Overlays\overlay_save_dialog.h">
       <Filter>Emu\GPU\RSX\Overlays</Filter>
     </ClInclude>
+    <ClInclude Include="Emu\RSX\Overlays\overlay_message.h">
+      <Filter>Emu\GPU\RSX\Overlays</Filter>
+    </ClInclude>
     <ClInclude Include="Emu\RSX\Overlays\overlay_message_dialog.h">
       <Filter>Emu\GPU\RSX\Overlays</Filter>
     </ClInclude>
@@ -2020,13 +2080,94 @@
     <ClInclude Include="Emu\Io\camera_config.h">
       <Filter>Emu\Io</Filter>
     </ClInclude>
+    <ClInclude Include="Emu\Audio\audio_resampler.h">
+      <Filter>Emu\Audio</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\NP\np_allocator.h">
+      <Filter>Emu\NP</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\NP\np_cache.h">
+      <Filter>Emu\NP</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\NP\np_dnshook.h">
+      <Filter>Emu\NP</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\NP\np_event_data.h">
+      <Filter>Emu\NP</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\NP\np_helpers.h">
+      <Filter>Emu\NP</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\Io\music_handler_base.h">
+      <Filter>Emu\Io</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\Io\Null\null_music_handler.h">
+      <Filter>Emu\Io\Null</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Utilities\simple_ringbuf.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Utilities\transactional_storage.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\Overlays\overlay_media_list_dialog.h">
+      <Filter>Emu\GPU\RSX\Overlays</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\Common\time.hpp">
+      <Filter>Emu\GPU\RSX\Common</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\perf_monitor.hpp">
+      <Filter>Emu</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\Common\ranged_map.hpp">
+      <Filter>Emu\GPU\RSX\Common</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\CPU\sse2neon.h">
+      <Filter>Emu\CPU</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\Common\buffer_stream.hpp">
+      <Filter>Emu\GPU\RSX\Common</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\Cell\Modules\cellRec.h">
+      <Filter>Emu\Cell\Modules</Filter>
+    </ClInclude>
+    <ClInclude Include="Crypto\decrypt_binaries.h">
+      <Filter>Crypto</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\RSXZCULL.h">
+      <Filter>Emu\GPU\RSX</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\IPC_socket.h">
+      <Filter>Emu</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\IPC_config.h">
+      <Filter>Emu</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <None Include="Emu\RSX\Common\Interpreter\FragmentInterpreter.glsl">
-      <Filter>Emu\GPU\RSX\Common\Interpreter</Filter>
+    <None Include="Emu\RSX\Program\GLSLSnippets\GPUDeswizzle.glsl">
+      <Filter>Emu\GPU\RSX\Program\Snippets</Filter>
     </None>
-    <None Include="Emu\RSX\Common\Interpreter\VertexInterpreter.glsl">
-      <Filter>Emu\GPU\RSX\Common\Interpreter</Filter>
+    <None Include="Emu\RSX\Program\GLSLInterpreter\FragmentInterpreter.glsl">
+      <Filter>Emu\GPU\RSX\Program\Interpreter</Filter>
+    </None>
+    <None Include="Emu\RSX\Program\GLSLInterpreter\VertexInterpreter.glsl">
+      <Filter>Emu\GPU\RSX\Program\Interpreter</Filter>
+    </None>
+    <None Include="Emu\RSX\Program\GLSLSnippets\ShuffleBytes.glsl">
+      <Filter>Emu\GPU\RSX\Program\Snippets</Filter>
+    </None>
+    <None Include="Emu\RSX\Program\GLSLSnippets\CopyBufferToD24x8.glsl">
+      <Filter>Emu\GPU\RSX\Program\Snippets</Filter>
+    </None>
+    <None Include="Emu\RSX\Program\GLSLSnippets\GenericVSPassthrough.glsl">
+      <Filter>Emu\GPU\RSX\Program\Snippets</Filter>
+    </None>
+    <None Include="Emu\RSX\Program\GLSLSnippets\CopyD24x8ToBuffer.glsl">
+      <Filter>Emu\GPU\RSX\Program\Snippets</Filter>
+    </None>
+    <None Include="Emu\RSX\Program\GLSLSnippets\CopyRGBA8ToBuffer.glsl">
+      <Filter>Emu\GPU\RSX\Program\Snippets</Filter>
     </None>
   </ItemGroup>
 </Project>

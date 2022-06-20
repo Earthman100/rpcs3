@@ -12,6 +12,9 @@ add_library(rpcs3_emu
     GDB.cpp
     title.cpp
     perf_meter.cpp
+    perf_monitor.cpp
+    IPC_config.cpp
+    IPC_socket.cpp
 )
 
 # prevent WolfSSL from warning about not having harden options
@@ -59,6 +62,11 @@ target_sources(rpcs3_emu PRIVATE
     ../../Utilities/Thread.cpp
     ../../Utilities/version.cpp
 )
+if(APPLE)
+    target_sources(rpcs3_emu PRIVATE
+        ../../darwin/util/sysinfo_darwin.mm
+    )
+endif()
 
 target_include_directories(rpcs3_emu PUBLIC "${CMAKE_SOURCE_DIR}")
 
@@ -82,6 +90,7 @@ endif()
 target_sources(rpcs3_emu PRIVATE
     ../Crypto/aes.cpp
     ../Crypto/aesni.cpp
+    ../Crypto/decrypt_binaries.cpp
     ../Crypto/ec.cpp
     ../Crypto/key_vault.cpp
     ../Crypto/lz.cpp
@@ -109,6 +118,7 @@ target_sources(rpcs3_emu PRIVATE
 # Audio
 target_sources(rpcs3_emu PRIVATE
     Audio/audio_device_listener.cpp
+    Audio/audio_resampler.cpp
     Audio/AudioDumper.cpp
     Audio/AudioBackend.cpp
     Audio/Cubeb/CubebBackend.cpp
@@ -138,6 +148,10 @@ target_link_libraries(rpcs3_emu
 target_link_libraries(rpcs3_emu
     PUBLIC
         3rdparty::cubeb)
+
+target_link_libraries(rpcs3_emu
+    PUBLIC
+        3rdparty::soundtouch)
 
 # Cell
 target_sources(rpcs3_emu PRIVATE
@@ -178,6 +192,14 @@ target_sources(rpcs3_emu PRIVATE
     Cell/lv2/sys_mmapper.cpp
     Cell/lv2/sys_mutex.cpp
     Cell/lv2/sys_net.cpp
+    Cell/lv2/sys_net/lv2_socket.cpp
+    Cell/lv2/sys_net/lv2_socket_native.cpp
+    Cell/lv2/sys_net/lv2_socket_raw.cpp
+    Cell/lv2/sys_net/lv2_socket_p2p.cpp
+    Cell/lv2/sys_net/lv2_socket_p2ps.cpp
+    Cell/lv2/sys_net/network_context.cpp
+    Cell/lv2/sys_net/nt_p2p_port.cpp
+    Cell/lv2/sys_net/sys_net_helpers.cpp
     Cell/lv2/sys_overlay.cpp
     Cell/lv2/sys_ppu_thread.cpp
     Cell/lv2/sys_process.cpp
@@ -397,6 +419,7 @@ target_sources(rpcs3_emu PRIVATE
     RSX/RSXOffload.cpp
     RSX/RSXTexture.cpp
     RSX/RSXThread.cpp
+    RSX/RSXZCULL.cpp
     RSX/rsx_utils.cpp
     RSX/RSXDisAsm.cpp
     RSX/Common/BufferUtils.cpp
@@ -409,6 +432,8 @@ target_sources(rpcs3_emu PRIVATE
     RSX/Overlays/overlay_edit_text.cpp
     RSX/Overlays/overlay_fonts.cpp
     RSX/Overlays/overlay_list_view.cpp
+    RSX/Overlays/overlay_media_list_dialog.cpp
+    RSX/Overlays/overlay_message.cpp
     RSX/Overlays/overlay_message_dialog.cpp
     RSX/Overlays/overlay_osk.cpp
     RSX/Overlays/overlay_osk_panel.cpp
@@ -431,6 +456,10 @@ target_sources(rpcs3_emu PRIVATE
     RSX/Program/VertexProgramDecompiler.cpp
     RSX/Capture/rsx_capture.cpp
     RSX/Capture/rsx_replay.cpp
+    RSX/GL/glutils/buffer_object.cpp
+    RSX/GL/glutils/common.cpp
+    RSX/GL/glutils/image.cpp
+    RSX/GL/glutils/ring_buffer.cpp
     RSX/GL/GLCommonDecompiler.cpp
     RSX/GL/GLCompute.cpp
     RSX/GL/GLDraw.cpp

@@ -11,8 +11,7 @@ namespace gl
 	void cached_texture_section::finish_flush()
 	{
 		// Free resources
-		glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
-		glBindBuffer(GL_PIXEL_PACK_BUFFER, GL_NONE);
+		pbo.unmap();
 
 		const auto valid_range = get_confirmed_range_delta();
 		const u32 valid_offset = valid_range.first;
@@ -38,16 +37,16 @@ namespace gl
 				ensure(real_pitch == (width * 4));
 				if (rsx_pitch == real_pitch) [[likely]]
 				{
-					stream_data_to_memory_swapped_u32<true>(dst, dst, valid_length / 4, 4);
+					copy_data_swap_u32(static_cast<u32*>(dst), static_cast<u32*>(dst), valid_length / 4);
 				}
 				else
 				{
 					const u32 num_rows = utils::align(valid_length, rsx_pitch) / rsx_pitch;
-					u8* data = static_cast<u8*>(dst);
+					u32* data = static_cast<u32*>(dst);
 					for (u32 row = 0; row < num_rows; ++row)
 					{
-						stream_data_to_memory_swapped_u32<true>(data, data, width, 4);
-						data += rsx_pitch;
+						copy_data_swap_u32(data, data, width);
+						data += rsx_pitch / 4;
 					}
 				}
 				break;
@@ -80,12 +79,6 @@ namespace gl
 			default:
 				rsx_log.error("Unexpected swizzled texture format 0x%x", static_cast<u32>(format));
 			}
-		}
-
-		if (context == rsx::texture_upload_context::framebuffer_storage)
-		{
-			// Update memory tag
-			static_cast<gl::render_target*>(vram_texture)->sync_tag();
 		}
 	}
 
@@ -145,8 +138,8 @@ namespace gl
 			if (!slice.src)
 				continue;
 
-			const bool typeless = dst_aspect != slice.src->aspect() ||
-				!formats_are_bitcast_compatible(static_cast<GLenum>(slice.src->get_internal_format()), static_cast<GLenum>(dst_image->get_internal_format()));
+			const bool typeless = !formats_are_bitcast_compatible(slice.src, dst_image);
+			ensure(typeless || dst_aspect == slice.src->aspect());
 
 			std::unique_ptr<gl::texture> tmp;
 			auto src_image = slice.src;
@@ -172,7 +165,7 @@ namespace gl
 			{
 				const auto src_bpp = slice.src->pitch() / slice.src->width();
 				const u16 convert_w = u16(slice.src->width() * src_bpp) / dst_bpp;
-				tmp = std::make_unique<texture>(GL_TEXTURE_2D, convert_w, slice.src->height(), 1, 1, static_cast<GLenum>(dst_image->get_internal_format()));
+				tmp = std::make_unique<texture>(GL_TEXTURE_2D, convert_w, slice.src->height(), 1, 1, static_cast<GLenum>(dst_image->get_internal_format()), dst_image->format_class());
 
 				src_image = tmp.get();
 
@@ -186,14 +179,14 @@ namespace gl
 					// Combine the two transfers into one
 					const coord3u src_region = { { src_x, src_y, 0 }, { src_w, src_h, 1 } };
 					const coord3u dst_region = { { slice.dst_x, slice.dst_y, slice.dst_z }, { slice.dst_w, slice.dst_h, 1 } };
-					gl::copy_typeless(dst_image, slice.src, dst_region, src_region);
+					gl::copy_typeless(cmd, dst_image, slice.src, dst_region, src_region);
 
 					continue;
 				}
 
 				const coord3u src_region = { { src_x, src_y, 0 }, { src_w, src_h, 1 } };
 				const coord3u dst_region = { { src_x2, src_y, 0 }, { src_w2, src_h, 1 } };
-				gl::copy_typeless(src_image, slice.src, dst_region, src_region);
+				gl::copy_typeless(cmd, src_image, slice.src, dst_region, src_region);
 
 				src_x = src_x2;
 				src_w = src_w2;

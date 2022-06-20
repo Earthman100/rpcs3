@@ -1079,8 +1079,8 @@ namespace rsx
 		u16 depth;
 		u16 mipmaps;
 
-		u16 real_pitch;
-		u16 rsx_pitch;
+		u32 real_pitch;
+		u32 rsx_pitch;
 
 		u32 gcm_format = 0;
 		bool pack_unpack_swap_bytes = false;
@@ -1353,9 +1353,28 @@ namespace rsx
 
 				set_dirty(false);
 			}
+
+			if (context == rsx::texture_upload_context::framebuffer_storage && !Emu.IsStopped())
+			{
+				// Lock, unlock
+				if (prot == utils::protection::no && old_prot != utils::protection::no)
+				{
+					// Locked memory. We have to take ownership of the object in the surface cache as well
+					auto surface = derived()->get_render_target();
+					surface->add_ref();
+				}
+				else if (old_prot == utils::protection::no && prot != utils::protection::no)
+				{
+					// Release the surface, the cache can remove it if needed
+					ensure(prot == utils::protection::rw);
+					auto surface = derived()->get_render_target();
+					surface->release();
+				}
+			}
 		}
 
 	public:
+
 		inline void protect(utils::protection prot)
 		{
 			utils::protection old_prot = get_protection();
@@ -1442,6 +1461,11 @@ namespace rsx
 			}
 
 			flush_exclusions.clear();
+
+			if (context == rsx::texture_upload_context::framebuffer_storage)
+			{
+				derived()->get_render_target()->sync_tag();
+			}
 		}
 
 		void on_speculative_flush()
@@ -1704,7 +1728,7 @@ namespace rsx
 			return mipmaps;
 		}
 
-		u16 get_rsx_pitch() const
+		u32 get_rsx_pitch() const
 		{
 			return rsx_pitch;
 		}

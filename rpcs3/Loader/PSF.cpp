@@ -116,10 +116,6 @@ namespace psf
 	{
 	}
 
-	entry::~entry()
-	{
-	}
-
 	const std::string& entry::as_string() const
 	{
 		ensure(m_type == format::string || m_type == format::array);
@@ -189,12 +185,12 @@ namespace psf
 
 		// Get indices
 		std::vector<def_table_t> indices;
-		PSF_CHECK(stream.read<true>(indices, header.entries_num), corrupt);
+		PSF_CHECK(stream.read(indices, header.entries_num), corrupt);
 
 		// Get keys
 		std::string keys;
 		PSF_CHECK(stream.seek(header.off_key_table) == header.off_key_table, corrupt);
-		PSF_CHECK(stream.read<true>(keys, header.off_data_table - header.off_key_table), corrupt);
+		PSF_CHECK(stream.read(keys, header.off_data_table - header.off_key_table), corrupt);
 
 		// Load entries
 		for (u32 i = 0; i < header.entries_num; ++i)
@@ -227,7 +223,7 @@ namespace psf
 			{
 				// String/array data
 				std::string value;
-				PSF_CHECK(stream.read<true>(value, indices[i].param_len), corrupt);
+				PSF_CHECK(stream.read(value, indices[i].param_len), corrupt);
 
 				if (indices[i].param_fmt == format::string)
 				{
@@ -244,6 +240,15 @@ namespace psf
 				// Possibly unsupported format, entry ignored
 				psf_log.error("Unknown entry format (key='%s', fmt=0x%x, len=0x%x, max=0x%x)", key, indices[i].param_fmt, indices[i].param_len, indices[i].param_max);
 			}
+		}
+
+		const auto cat = get_string(pair.sfo, "CATEGORY", "");
+		constexpr std::string_view valid_cats[]{"GD", "DG", "HG", "AM", "AP", "AT", "AV", "BV", "WT", "HM", "CB", "SF", "2P", "2G", "1P", "PP", "MN", "PE", "2D", "SD", "MS"};
+
+		if (std::find(std::begin(valid_cats), std::end(valid_cats), cat) == std::end(valid_cats))
+		{
+			psf_log.error("Unknown category ('%s')", cat);
+			PSF_CHECK(false, corrupt);
 		}
 
 #undef PSF_CHECK
@@ -339,7 +344,7 @@ namespace psf
 		return std::move(static_cast<fs::container_stream<std::vector<u8>>*>(stream.release().get())->obj);
 	}
 
-	std::string_view get_string(const registry& psf, const std::string& key, std::string_view def)
+	std::string_view get_string(const registry& psf, std::string_view key, std::string_view def)
 	{
 		const auto found = psf.find(key);
 
@@ -351,7 +356,7 @@ namespace psf
 		return found->second.as_string();
 	}
 
-	u32 get_integer(const registry& psf, const std::string& key, u32 def)
+	u32 get_integer(const registry& psf, std::string_view key, u32 def)
 	{
 		const auto found = psf.find(key);
 

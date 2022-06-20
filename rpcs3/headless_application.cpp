@@ -6,6 +6,7 @@
 #include "Emu/Cell/Modules/cellSaveData.h"
 #include "Emu/Cell/Modules/sceNpTrophy.h"
 #include "Emu/Io/Null/null_camera_handler.h"
+#include "Emu/Io/Null/null_music_handler.h"
 
 #include <clocale>
 
@@ -34,7 +35,7 @@ bool headless_application::Init()
 void headless_application::InitializeConnects() const
 {
 	qRegisterMetaType<std::function<void()>>("std::function<void()>");
-	connect(this, &headless_application::RequestCallAfter, this, &headless_application::HandleCallAfter);
+	connect(this, &headless_application::RequestCallFromMainThread, this, &headless_application::CallFromMainThread);
 }
 
 /** RPCS3 emulator has functions it desires to call from the GUI at times. Initialize them in here. */
@@ -57,9 +58,9 @@ void headless_application::InitializeCallbacks()
 
 		return false;
 	};
-	callbacks.call_after = [this](std::function<void()> func)
+	callbacks.call_from_main_thread = [this](std::function<void()> func)
 	{
-		RequestCallAfter(std::move(func));
+		RequestCallFromMainThread(std::move(func));
 	};
 
 	callbacks.init_gs_render = []()
@@ -72,9 +73,7 @@ void headless_application::InitializeCallbacks()
 			break;
 		}
 		case video_renderer::opengl:
-#if defined(HAVE_VULKAN)
 		case video_renderer::vulkan:
-#endif
 		{
 			fmt::throw_exception("Headless mode can only be used with the %s video renderer. Current renderer: %s", video_renderer::null, type);
 			[[fallthrough]];
@@ -98,6 +97,22 @@ void headless_application::InitializeCallbacks()
 		case camera_handler::qt:
 		{
 			fmt::throw_exception("Headless mode can not be used with this camera handler. Current handler: %s", g_cfg.io.camera.get());
+		}
+		}
+		return nullptr;
+	};
+
+	callbacks.get_music_handler = []() -> std::shared_ptr<music_handler_base>
+	{
+		switch (g_cfg.audio.music.get())
+		{
+		case music_handler::null:
+		{
+			return std::make_shared<null_music_handler>();
+		}
+		case music_handler::qt:
+		{
+			fmt::throw_exception("Headless mode can not be used with this music handler. Current handler: %s", g_cfg.audio.music.get());
 		}
 		}
 		return nullptr;
@@ -138,7 +153,7 @@ void headless_application::InitializeCallbacks()
 /**
  * Using connects avoids timers being unable to be used in a non-qt thread. So, even if this looks stupid to just call func, it's succinct.
  */
-void headless_application::HandleCallAfter(const std::function<void()>& func)
+void headless_application::CallFromMainThread(const std::function<void()>& func)
 {
 	func();
 }

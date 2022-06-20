@@ -123,7 +123,7 @@ public:
 	static void initialize_modules();
 
 	template <auto* Func>
-	static auto& register_static_function(const char* _module, const char* name, ppu_function_t func, u32 fnid)
+	static auto& register_static_function(const char* _module, const char* name, ppu_intrp_func_t func, u32 fnid)
 	{
 		auto& info = access_static_function(_module, fnid);
 
@@ -270,6 +270,7 @@ public:
 	static const ppu_static_module sceNpTrophy;
 	static const ppu_static_module sceNpTus;
 	static const ppu_static_module sceNpUtil;
+	static const ppu_static_module sceNpPlus;
 	static const ppu_static_module sys_crashdump;
 	static const ppu_static_module sys_io;
 	static const ppu_static_module sys_net;

@@ -47,6 +47,18 @@ namespace vk
 
 		void create(u16 w, u16 h, u16 depth, u16 mipmaps, vk::image* image, u32 rsx_pitch, bool managed, u32 gcm_format, bool pack_swap_bytes = false)
 		{
+			if (vram_texture && !managed_texture && get_protection() == utils::protection::no)
+			{
+				// In-place image swap, still locked. Likely a color buffer that got rebound as depth buffer or vice-versa.
+				vk::as_rtt(vram_texture)->release();
+
+				if (!managed)
+				{
+					// Incoming is also an external resource, reference it immediately
+					vk::as_rtt(image)->add_ref();
+				}
+			}
+
 			auto new_texture = static_cast<vk::viewable_image*>(image);
 			ensure(!exists() || !is_managed() || vram_texture == new_texture);
 			vram_texture = new_texture;
@@ -151,6 +163,11 @@ namespace vk
 			return managed_texture;
 		}
 
+		vk::render_target* get_render_target()
+		{
+			return vk::as_rtt(vram_texture);
+		}
+
 		VkFormat get_format() const
 		{
 			if (context == rsx::texture_upload_context::dma)
@@ -197,8 +214,8 @@ namespace vk
 			if (context == rsx::texture_upload_context::framebuffer_storage)
 			{
 				auto surface = vk::as_rtt(vram_texture);
-				surface->read_barrier(cmd);
-				locked_resource = surface->get_surface(rsx::surface_access::shader_read);
+				surface->memory_barrier(cmd, rsx::surface_access::transfer_read);
+				locked_resource = surface->get_surface(rsx::surface_access::transfer_read);
 				transfer_width *= surface->samples_x;
 				transfer_height *= surface->samples_y;
 			}
@@ -293,12 +310,6 @@ namespace vk
 					rsx_log.error("Unexpected swizzled texture format 0x%x", gcm_format);
 				}
 			}
-
-			if (context == rsx::texture_upload_context::framebuffer_storage)
-			{
-				// Update memory tag
-				static_cast<vk::render_target*>(vram_texture)->sync_tag();
-			}
 		}
 
 		void* map_synchronized(u32, u32)
@@ -317,7 +328,7 @@ namespace vk
 			pack_unpack_swap_bytes = swap_bytes;
 		}
 
-		void set_rsx_pitch(u16 pitch)
+		void set_rsx_pitch(u32 pitch)
 		{
 			ensure(!is_locked());
 			rsx_pitch = pitch;
@@ -346,60 +357,7 @@ namespace vk
 
 		bool is_depth_texture() const
 		{
-			switch (vram_texture->info.format)
-			{
-			case VK_FORMAT_D16_UNORM:
-			case VK_FORMAT_D32_SFLOAT:
-			case VK_FORMAT_D32_SFLOAT_S8_UINT:
-			case VK_FORMAT_D24_UNORM_S8_UINT:
-				return true;
-			default:
-				return false;
-			}
-		}
-	};
-
-	struct temporary_storage
-	{
-		std::unique_ptr<vk::viewable_image> combined_image;
-		bool can_reuse = false;
-
-		// Memory held by this temp storage object
-		u32 block_size = 0;
-
-		// Frame id tag
-		const u64 frame_tag = vk::get_current_frame_id();
-
-		temporary_storage(std::unique_ptr<vk::viewable_image>& _img)
-		{
-			combined_image = std::move(_img);
-		}
-
-		temporary_storage(vk::cached_texture_section& tex)
-		{
-			combined_image = std::move(tex.get_texture());
-			block_size = tex.get_section_size();
-		}
-
-		bool test(u64 ref_frame) const
-		{
-			return ref_frame > 0 && frame_tag <= ref_frame;
-		}
-
-		bool matches(VkFormat format, u16 w, u16 h, u16 d, u16 mipmaps, VkFlags flags) const
-		{
-			if (combined_image &&
-				combined_image->info.flags == flags &&
-				combined_image->format() == format &&
-				combined_image->width() == w &&
-				combined_image->height() == h &&
-				combined_image->depth() == d &&
-				combined_image->mipmaps() == mipmaps)
-			{
-				return true;
-			}
-
-			return false;
+			return !!(vram_texture->aspect() & VK_IMAGE_ASPECT_DEPTH_BIT);
 		}
 	};
 
@@ -409,26 +367,51 @@ namespace vk
 		using baseclass = rsx::texture_cache<vk::texture_cache, vk::texture_cache_traits>;
 		friend baseclass;
 
+		struct cached_image_reference_t
+		{
+			std::unique_ptr<vk::viewable_image> data;
+			texture_cache* parent;
+
+			cached_image_reference_t(texture_cache* parent, std::unique_ptr<vk::viewable_image>& previous);
+			~cached_image_reference_t();
+		};
+
+		struct cached_image_t
+		{
+			u64 key;
+			std::unique_ptr<vk::viewable_image> data;
+
+			cached_image_t() = default;
+			cached_image_t(u64 key_, std::unique_ptr<vk::viewable_image>& data_) :
+				key(key_), data(std::move(data_)) {}
+		};
+
 	public:
 		enum texture_create_flags : u32
 		{
 			initialize_image_contents = 1,
+			do_not_reuse = 2
 		};
 
 		void on_section_destroyed(cached_texture_section& tex) override;
 
 	private:
 
-		//Vulkan internals
+		// Vulkan internals
 		vk::render_device* m_device;
 		vk::memory_type_mapping m_memory_types;
 		vk::gpu_formats_support m_formats_support;
 		VkQueue m_submit_queue;
 		vk::data_heap* m_texture_upload_heap;
 
-		//Stuff that has been dereferenced goes into these
-		std::list<temporary_storage> m_temporary_storage;
-		atomic_t<u32> m_temporary_memory_size = { 0 };
+		// Stuff that has been dereferenced by the GPU goes into these
+		const u32 max_cached_image_pool_size = 256;
+		std::deque<cached_image_t> m_cached_images;
+		atomic_t<u64> m_cached_memory_size = { 0 };
+		shared_mutex m_cached_pool_lock;
+
+		// Blocks some operations when exiting
+		atomic_t<bool> m_cache_is_exiting = false;
 
 		void clear();
 
@@ -438,9 +421,7 @@ namespace vk
 
 		vk::image* get_template_from_collection_impl(const std::vector<copy_region_descriptor>& sections_to_transfer) const;
 
-		std::unique_ptr<vk::viewable_image> find_temporary_image(VkFormat format, u16 w, u16 h, u16 d, u8 mipmaps);
-
-		std::unique_ptr<vk::viewable_image> find_temporary_cubemap(VkFormat format, u16 size);
+		std::unique_ptr<vk::viewable_image> find_cached_image(VkFormat format, u16 w, u16 h, u16 d, u16 mipmaps, VkImageType type, VkImageCreateFlags create_flags, VkImageUsageFlags usage);
 
 	protected:
 		vk::image_view* create_temporary_subresource_view_impl(vk::command_buffer& cmd, vk::image* source, VkImageType image_type, VkImageViewType view_type,
@@ -468,12 +449,12 @@ namespace vk
 
 		void update_image_contents(vk::command_buffer& cmd, vk::image_view* dst_view, vk::image* src, u16 width, u16 height) override;
 
-		cached_texture_section* create_new_texture(vk::command_buffer& cmd, const utils::address_range& rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u16 pitch,
+		cached_texture_section* create_new_texture(vk::command_buffer& cmd, const utils::address_range& rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u32 pitch,
 			u32 gcm_format, rsx::texture_upload_context context, rsx::texture_dimension_extended type, bool swizzled, rsx::component_order swizzle_flags, rsx::flags32_t flags) override;
 
 		cached_texture_section* create_nul_section(vk::command_buffer& cmd, const utils::address_range& rsx_range, bool memory_load) override;
 
-		cached_texture_section* upload_image_from_cpu(vk::command_buffer& cmd, const utils::address_range& rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u16 pitch, u32 gcm_format,
+		cached_texture_section* upload_image_from_cpu(vk::command_buffer& cmd, const utils::address_range& rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u32 pitch, u32 gcm_format,
 			rsx::texture_upload_context context, const std::vector<rsx::subresource_layout>& subresource_layout, rsx::texture_dimension_extended type, bool swizzled) override;
 
 		void set_component_order(cached_texture_section& section, u32 gcm_format, rsx::component_order expected_flags) override;
@@ -505,7 +486,7 @@ namespace vk
 
 		bool handle_memory_pressure(rsx::problem_severity severity) override;
 
-		u32 get_temporary_memory_in_use() const;
+		u64 get_temporary_memory_in_use() const;
 
 		bool is_overallocated() const;
 	};

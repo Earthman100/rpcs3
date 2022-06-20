@@ -18,6 +18,11 @@ add_library(3rdparty_flatbuffers INTERFACE)
 if (USE_SYSTEM_FLATBUFFERS)
 	pkg_check_modules(FLATBUFFERS REQUIRED IMPORTED_TARGET flatbuffers>=2.0.0)
 	target_link_libraries(3rdparty_flatbuffers INTERFACE PkgConfig::FLATBUFFERS)
+	set(FBS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rpcs3/Emu/NP/generated/")
+	execute_process(COMMAND flatc --cpp -o "${FBS_DIR}" "${FBS_DIR}/np2_structs.fbs" RESULT_VARIABLE FBS_CMD_ERROR)
+	if(FBS_CMD_ERROR AND NOT FBS_CMD_ERROR EQUAL 0)
+		message(FATAL_ERROR "flatc failed to regenerate flatbuffers headers.")
+	endif()
 else()
 	target_include_directories(3rdparty_flatbuffers INTERFACE flatbuffers/include)
 endif()
@@ -131,6 +136,9 @@ add_subdirectory(discord-rpc)
 # Cubeb
 add_subdirectory(cubeb EXCLUDE_FROM_ALL)
 
+# SoundTouch
+add_subdirectory(SoundTouch EXCLUDE_FROM_ALL)
+
 # libevdev
 set(LIBEVDEV_TARGET 3rdparty_dummy_lib)
 if(USE_LIBEVDEV)
@@ -150,6 +158,33 @@ endif()
 # Vulkan
 set(VULKAN_TARGET 3rdparty_dummy_lib)
 if(USE_VULKAN)
+	if(APPLE)
+		if(USE_SYSTEM_MVK)
+			message("-- RPCS3: Using system MoltenVK")
+		else()
+			message("-- RPCS3: MoltenVK submodule")
+
+			execute_process(COMMAND "${CMAKE_COMMAND}" -G "${CMAKE_GENERATOR}" .
+    				WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK"
+			)
+			execute_process(COMMAND "${CMAKE_COMMAND}" --build .
+   	 			WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK"
+			)
+
+			add_library(moltenvk_lib SHARED IMPORTED)
+			add_dependencies(moltenvk_lib moltenvk)
+			set_target_properties(moltenvk_lib
+				PROPERTIES IMPORTED_LOCATION "{Vulkan_LIBRARY}"
+			)
+
+			set(VULKAN_SDK "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK/MoltenVK/MoltenVK")
+			set(VK_ICD_FILENAMES "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK/MoltenVK/MoltenVK/icd/MoltenVK_icd.json")
+			set(Vulkan_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK/MoltenVK/MoltenVK/include")
+			set(Vulkan_LIBRARY "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK/MoltenVK/Build/Products/Release/dynamic/libMoltenVK.dylib")
+			set(Vulkan_TOOLS "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK/MoltenVK/Build/Products/Release")
+		endif()
+	endif()
+
 	find_package(Vulkan)
 	if(VULKAN_FOUND)
 		add_library(3rdparty_vulkan INTERFACE)
@@ -170,6 +205,9 @@ if(USE_VULKAN)
 		set(VULKAN_TARGET 3rdparty_vulkan)
 	else()
 		message("WARNING! USE_VULKAN was enabled, but libvulkan was not found. RPCS3 will be compiled without Vulkan support.")
+		if(APPLE)
+			message( FATAL_ERROR "ERROR! To build without Vulkan support on macOS, please disable USE_VULKAN.")
+		endif()
 	endif()
 endif()
 
@@ -239,6 +277,7 @@ else()
 		set(FFMPEG_LIB_AVCODEC "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg/windows/x86_64/lib/libavcodec.a")
 		set(FFMPEG_LIB_AVUTIL "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg/windows/x86_64/lib/libavutil.a")
 		set(FFMPEG_LIB_SWSCALE "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg/windows/x86_64/lib/libswscale.a")
+		set(FFMPEG_LIB_SWRESAMPLE "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg/windows/x86_64/lib/libswresample.a")
 	else()
 		message("-- RPCS3: using builtin ffmpeg")
 
@@ -257,6 +296,7 @@ else()
 		find_library(FFMPEG_LIB_AVCODEC avcodec PATHS ${FFMPEG_LIB_DIR} NO_DEFAULT_PATH)
 		find_library(FFMPEG_LIB_AVUTIL avutil PATHS ${FFMPEG_LIB_DIR} NO_DEFAULT_PATH)
 		find_library(FFMPEG_LIB_SWSCALE swscale PATHS ${FFMPEG_LIB_DIR} NO_DEFAULT_PATH)
+		find_library(FFMPEG_LIB_SWRESAMPLE swresample PATHS ${FFMPEG_LIB_DIR} NO_DEFAULT_PATH)
 	endif()
 
 	target_include_directories(3rdparty_ffmpeg INTERFACE "ffmpeg/include")
@@ -266,7 +306,9 @@ else()
 			${FFMPEG_LIB_AVFORMAT}
 			${FFMPEG_LIB_AVCODEC}
 			${FFMPEG_LIB_AVUTIL}
-			${FFMPEG_LIB_SWSCALE})
+			${FFMPEG_LIB_SWSCALE}
+			${FFMPEG_LIB_SWRESAMPLE}
+	)
 endif()
 
 
@@ -312,3 +354,4 @@ add_library(3rdparty::ffmpeg ALIAS 3rdparty_ffmpeg)
 add_library(3rdparty::glew ALIAS 3rdparty_glew)
 add_library(3rdparty::wolfssl ALIAS wolfssl)
 add_library(3rdparty::libcurl ALIAS libcurl)
+add_library(3rdparty::soundtouch ALIAS soundtouch)

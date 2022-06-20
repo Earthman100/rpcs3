@@ -1027,6 +1027,30 @@
                  </widget>
                 </item>
                 <item>
+                 <widget class="QGroupBox" name="gb_mouse_movement">
+                  <property name="title">
+                   <string>Mouse Movement Mode</string>
+                  </property>
+                  <layout class="QVBoxLayout" name="gb_mouse_movement_layout">
+                   <property name="leftMargin">
+                    <number>5</number>
+                   </property>
+                   <property name="topMargin">
+                    <number>5</number>
+                   </property>
+                   <property name="rightMargin">
+                    <number>5</number>
+                   </property>
+                   <property name="bottomMargin">
+                    <number>5</number>
+                   </property>
+                   <item>
+                    <widget class="QComboBox" name="mouse_movement"/>
+                   </item>
+                  </layout>
+                 </widget>
+                </item>
+                <item>
                  <spacer name="mouse_page_spacer">
                   <property name="orientation">
                    <enum>Qt::Vertical</enum>
@@ -2342,6 +2366,9 @@
                        <property name="text">
                         <string/>
                        </property>
+                       <property name="alignment">
+                        <set>Qt::AlignCenter</set>
+                       </property>
                       </widget>
                      </item>
                     </layout>
@@ -2360,6 +2387,9 @@
                        <property name="text">
                         <string/>
                        </property>
+                       <property name="alignment">
+                        <set>Qt::AlignCenter</set>
+                       </property>
                       </widget>
                      </item>
                     </layout>
@@ -2369,8 +2399,8 @@
                 </item>
                </layout>
               </widget>
-              <widget class="QWidget" name="smooth_page">
-               <layout class="QVBoxLayout" name="smooth_page_layout">
+              <widget class="QWidget" name="keyboard_page">
+               <layout class="QVBoxLayout" name="keyboard_page_layout">
                 <property name="leftMargin">
                  <number>0</number>
                 </property>
@@ -2383,6 +2413,81 @@
                 <property name="bottomMargin">
                  <number>0</number>
                 </property>
+                <item>
+                 <widget class="QGroupBox" name="gb_kb_stick_multi">
+                  <property name="title">
+                   <string>Stick Multipliers</string>
+                  </property>
+                  <layout class="QHBoxLayout" name="gb_kb_stick_multi_layout">
+                   <property name="leftMargin">
+                    <number>5</number>
+                   </property>
+                   <property name="topMargin">
+                    <number>5</number>
+                   </property>
+                   <property name="rightMargin">
+                    <number>5</number>
+                   </property>
+                   <property name="bottomMargin">
+                    <number>5</number>
+                   </property>
+                   <item>
+                    <widget class="QLabel" name="label_kb_stick_multi_left">
+                     <property name="text">
+                      <string>Left</string>
+                     </property>
+                    </widget>
+                   </item>
+                   <item>
+                    <widget class="QDoubleSpinBox" name="kb_stick_multi_left">
+                     <property name="singleStep">
+                      <double>0.100000000000000</double>
+                     </property>
+                    </widget>
+                   </item>
+                   <item>
+                    <spacer name="spacer_kb_stick_multi_left">
+                     <property name="orientation">
+                      <enum>Qt::Horizontal</enum>
+                     </property>
+                     <property name="sizeHint" stdset="0">
+                      <size>
+                       <width>0</width>
+                       <height>0</height>
+                      </size>
+                     </property>
+                    </spacer>
+                   </item>
+                   <item>
+                    <widget class="QLabel" name="label_kb_stick_multi_right">
+                     <property name="text">
+                      <string>Right</string>
+                     </property>
+                    </widget>
+                   </item>
+                   <item>
+                    <widget class="QDoubleSpinBox" name="kb_stick_multi_right">
+                     <property name="singleStep">
+                      <double>0.100000000000000</double>
+                     </property>
+                    </widget>
+                   </item>
+                   <item>
+                    <spacer name="spacer_kb_stick_multi_right">
+                     <property name="orientation">
+                      <enum>Qt::Horizontal</enum>
+                     </property>
+                     <property name="sizeHint" stdset="0">
+                      <size>
+                       <width>0</width>
+                       <height>0</height>
+                      </size>
+                     </property>
+                    </spacer>
+                   </item>
+                  </layout>
+                 </widget>
+                </item>
                 <item>
                  <widget class="QGroupBox" name="gb_stick_lerp">
                   <property name="title">
@@ -2465,7 +2570,7 @@
                  </widget>
                 </item>
                 <item>
-                 <spacer name="smooth_page_spacer">
+                 <spacer name="keyboard_page_spacer">
                   <property name="orientation">
                    <enum>Qt::Vertical</enum>
                   </property>

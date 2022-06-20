@@ -137,6 +137,8 @@ void GLGSRender::update_draw_state()
 {
 	m_profiler.start();
 
+	gl_state.enable(GL_SCISSOR_TEST);
+
 	for (int index = 0; index < m_rtts.get_color_surface_count(); ++index)
 	{
 		bool color_mask_b = rsx::method_registers.color_mask_b(index);
@@ -144,10 +146,16 @@ void GLGSRender::update_draw_state()
 		bool color_mask_r = rsx::method_registers.color_mask_r(index);
 		bool color_mask_a = rsx::method_registers.color_mask_a(index);
 
-		if (rsx::method_registers.surface_color() == rsx::surface_color_format::g8b8)
+		switch (rsx::method_registers.surface_color())
 		{
-			//Map GB components onto RG
+		case rsx::surface_color_format::b8:
+			rsx::get_b8_colormask(color_mask_r, color_mask_g, color_mask_b, color_mask_a);
+			break;
+		case rsx::surface_color_format::g8b8:
 			rsx::get_g8b8_r8g8_colormask(color_mask_r, color_mask_g, color_mask_b, color_mask_a);
+			break;
+		default:
+			break;
 		}
 
 		gl_state.color_maski(index, color_mask_r, color_mask_g, color_mask_b, color_mask_a);
@@ -292,13 +300,15 @@ void GLGSRender::load_texture_env()
 			if (tex.enabled())
 			{
 				*sampler_state = m_gl_texture_cache.upload_texture(cmd, tex, m_rtts);
-
-				if (m_textures_dirty[i])
-					m_fs_sampler_states[i].apply(tex, fs_sampler_state[i].get());
 			}
 			else
 			{
 				*sampler_state = {};
+			}
+
+			if (m_textures_dirty[i] && sampler_state->validate())
+			{
+				m_fs_sampler_states[i].apply(tex, fs_sampler_state[i].get());
 			}
 
 			m_textures_dirty[i] = false;
@@ -321,12 +331,16 @@ void GLGSRender::load_texture_env()
 			if (rsx::method_registers.vertex_textures[i].enabled())
 			{
 				*sampler_state = m_gl_texture_cache.upload_texture(cmd, rsx::method_registers.vertex_textures[i], m_rtts);
-
-				if (m_vertex_textures_dirty[i])
-					m_vs_sampler_states[i].apply(tex, vs_sampler_state[i].get());
 			}
 			else
+			{
 				*sampler_state = {};
+			}
+
+			if (m_vertex_textures_dirty[i] && sampler_state->validate())
+			{
+				m_vs_sampler_states[i].apply(tex, vs_sampler_state[i].get());
+			}
 
 			m_vertex_textures_dirty[i] = false;
 		}
@@ -345,8 +359,6 @@ void GLGSRender::bind_texture_env()
 		if (!(textures_ref & 1))
 			continue;
 
-		_SelectTexture(GL_FRAGMENT_TEXTURES_START + i);
-
 		gl::texture_view* view = nullptr;
 		auto sampler_state = static_cast<gl::texture_cache::sampled_image_descriptor*>(fs_sampler_state[i].get());
 
@@ -361,26 +373,23 @@ void GLGSRender::bind_texture_env()
 
 		if (view) [[likely]]
 		{
-			view->bind();
+			view->bind(cmd, GL_FRAGMENT_TEXTURES_START + i);
 
 			if (current_fragment_program.texture_state.redirected_textures & (1 << i))
 			{
-				_SelectTexture(GL_STENCIL_MIRRORS_START + i);
-
 				auto root_texture = static_cast<gl::viewable_image*>(view->image());
 				auto stencil_view = root_texture->get_view(0xAAE4, rsx::default_remap_vector, gl::image_aspect::stencil);
-				stencil_view->bind();
+				stencil_view->bind(cmd, GL_STENCIL_MIRRORS_START + i);
 			}
 		}
 		else
 		{
 			auto target = gl::get_target(current_fragment_program.get_texture_dimension(i));
-			glBindTexture(target, m_null_textures[target]->id());
+			cmd->bind_texture(GL_FRAGMENT_TEXTURES_START + i, target, m_null_textures[target]->id());
 
 			if (current_fragment_program.texture_state.redirected_textures & (1 << i))
 			{
-				_SelectTexture(GL_STENCIL_MIRRORS_START + i);
-				glBindTexture(target, m_null_textures[target]->id());
+				cmd->bind_texture(GL_STENCIL_MIRRORS_START + i, target, m_null_textures[target]->id());
 			}
 		}
 	}
@@ -391,23 +400,22 @@ void GLGSRender::bind_texture_env()
 			continue;
 
 		auto sampler_state = static_cast<gl::texture_cache::sampled_image_descriptor*>(vs_sampler_state[i].get());
-		_SelectTexture(GL_VERTEX_TEXTURES_START + i);
 
 		if (rsx::method_registers.vertex_textures[i].enabled() &&
 			sampler_state->validate())
 		{
 			if (sampler_state->image_handle) [[likely]]
 			{
-				sampler_state->image_handle->bind();
+				sampler_state->image_handle->bind(cmd, GL_VERTEX_TEXTURES_START + i);
 			}
 			else
 			{
-				m_gl_texture_cache.create_temporary_subresource(cmd, sampler_state->external_subresource_desc)->bind();
+				m_gl_texture_cache.create_temporary_subresource(cmd, sampler_state->external_subresource_desc)->bind(cmd, GL_VERTEX_TEXTURES_START + i);
 			}
 		}
 		else
 		{
-			glBindTexture(GL_TEXTURE_2D, GL_NONE);
+			cmd->bind_texture(GL_VERTEX_TEXTURES_START + i, GL_TEXTURE_2D, GL_NONE);
 		}
 	}
 }
@@ -427,6 +435,8 @@ void GLGSRender::emit_geometry(u32 sub_index)
 			//glMemoryBarrier(GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT);
 		}
 	};
+
+	m_profiler.start();
 
 	auto& draw_call = rsx::method_registers.current_draw_clause;
 	const rsx::flags32_t vertex_state_mask = rsx::vertex_base_changed | rsx::vertex_arrays_changed;
@@ -482,6 +492,10 @@ void GLGSRender::emit_geometry(u32 sub_index)
 
 	const GLenum draw_mode = gl::draw_mode(draw_call.primitive);
 	update_vertex_env(upload_info);
+
+	m_frame_stats.vertex_upload_time += m_profiler.duration();
+
+	gl_state.use_program(m_program->id());
 
 	if (!upload_info.index_info)
 	{
@@ -581,6 +595,8 @@ void GLGSRender::emit_geometry(u32 sub_index)
 			glMultiDrawElements(draw_mode, counts, index_type, offsets, static_cast<GLsizei>(draw_count));
 		}
 	}
+
+	m_frame_stats.draw_exec_time += m_profiler.duration();
 }
 
 void GLGSRender::begin()
@@ -607,7 +623,11 @@ void GLGSRender::end()
 		return;
 	}
 
-	analyse_current_rsx_pipeline();
+	if (m_graphics_state & (rsx::pipeline_state::fragment_program_ucode_dirty | rsx::pipeline_state::vertex_program_ucode_dirty))
+	{
+		analyse_current_rsx_pipeline();
+	}
+
 	m_frame_stats.setup_time += m_profiler.duration();
 
 	// Active texture environment is used to decode shaders
@@ -634,8 +654,6 @@ void GLGSRender::end()
 	m_gl_texture_cache.release_uncached_temporary_subresources();
 	m_frame_stats.textures_upload_time += m_profiler.duration();
 
-	gl_state.enable(GL_FALSE, GL_SCISSOR_TEST);
-
 	gl::command_context cmd{ gl_state };
 	if (auto ds = std::get<1>(m_rtts.m_bound_depth_stencil)) ds->write_barrier(cmd);
 
@@ -646,9 +664,6 @@ void GLGSRender::end()
 			surface->write_barrier(cmd);
 		}
 	}
-
-	// Unconditionally enable stencil test if it was disabled before
-	gl_state.enable(GL_TRUE, GL_SCISSOR_TEST);
 
 	update_draw_state();
 
@@ -665,7 +680,7 @@ void GLGSRender::end()
 	}
 	while (rsx::method_registers.current_draw_clause.next());
 
-	m_rtts.on_write(m_framebuffer_layout.color_write_enabled.data(), m_framebuffer_layout.zeta_write_enabled);
+	m_rtts.on_write(m_framebuffer_layout.color_write_enabled, m_framebuffer_layout.zeta_write_enabled);
 
 	m_attrib_ring_buffer->notify();
 	m_index_ring_buffer->notify();
@@ -676,7 +691,7 @@ void GLGSRender::end()
 	m_fragment_constants_buffer->notify();
 	m_transform_constants_buffer->notify();
 
-	m_frame_stats.textures_upload_time += m_profiler.duration();
+	m_frame_stats.setup_time += m_profiler.duration();
 
 	rsx::thread::end();
 }

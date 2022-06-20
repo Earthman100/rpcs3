@@ -9,6 +9,7 @@
 #include <map>
 
 #include "util/asm.hpp"
+#include "util/coro.hpp"
 
 using namespace std::literals::string_literals;
 
@@ -1182,7 +1183,7 @@ fs::file::file(const std::string& path, bs_t<open_mode> mode)
 
 			for (const char* data = static_cast<const char*>(buffer); count;)
 			{
-				const DWORD size = static_cast<DWORD>(std::min<u64>(count, DWORD{umax} & -4096)); 
+				const DWORD size = static_cast<DWORD>(std::min<u64>(count, DWORD{umax} & -4096));
 
 				DWORD nwritten = 0;
 				ensure(WriteFile(m_handle, data, size, &nwritten, nullptr)); // "file::write"
@@ -1412,6 +1413,12 @@ fs::file::file(const std::string& path, bs_t<open_mode> mode)
 	};
 
 	m_file = std::make_unique<unix_file>(fd);
+
+	if (mode & fs::isfile && !(mode & fs::write) && stat().is_directory)
+	{
+		m_file.reset();
+		g_tls_error = error::isdir;
+	}
 #endif
 }
 
@@ -1658,7 +1665,7 @@ bool fs::dir::open(const std::string& path)
 
 bool fs::file::strict_read_check(u64 _size, u64 type_size) const
 {
-	if (usz pos0 = pos(), size0 = size(); pos0 >= size0 || (size0 - pos0) / type_size < _size)
+	if (usz pos0 = pos(), size0 = size(); (pos0 >= size0 ? 0 : (size0 - pos0)) / type_size < _size)
 	{
 		fs::g_tls_error = fs::error::inval;
 		return false;
@@ -1781,7 +1788,7 @@ const std::string& fs::get_temp_dir()
 	return s_dir;
 }
 
-bool fs::remove_all(const std::string& path, bool remove_root)
+bool fs::remove_all(const std::string& path, bool remove_root, bool is_no_dir_ok)
 {
 	if (const auto root_dir = dir(path))
 	{
@@ -1810,7 +1817,7 @@ bool fs::remove_all(const std::string& path, bool remove_root)
 	}
 	else
 	{
-		return false;
+		return is_no_dir_ok;
 	}
 
 	if (remove_root)
@@ -2037,6 +2044,30 @@ bool fs::pending_file::commit(bool overwrite)
 #endif
 
 	return false;
+}
+
+stx::generator<fs::dir_entry&> fs::list_dir_recursively(std::string path)
+{
+	for (auto& entry : fs::dir(path))
+	{
+		if (entry.name == "." || entry.name == "..")
+		{
+			continue;
+		}
+
+		std::string new_path = path_append(path, entry.name);
+
+		if (entry.is_directory)
+		{
+			for (auto& nested : fs::list_dir_recursively(new_path))
+			{
+				co_yield nested;
+			}
+		}
+
+		entry.name = std::move(new_path);
+		co_yield entry;
+	}
 }
 
 template<>

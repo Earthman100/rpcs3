@@ -81,7 +81,7 @@ bool emu_settings::Init()
 	if (m_render_creator->Vulkan.supported && !m_render_creator->Vulkan.adapters.empty())
 	{
 		const std::string adapter = sstr(m_render_creator->Vulkan.adapters.at(0));
-		cfg_log.notice("Setting the default renderer to Vulkan. Default GPU: '%s')", adapter);
+		cfg_log.notice("Setting the default renderer to Vulkan. Default GPU: '%s'", adapter);
 		Emu.SetDefaultRenderer(video_renderer::vulkan);
 		Emu.SetDefaultGraphicsAdapter(adapter);
 	}
@@ -955,6 +955,7 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		case frame_limit_type::_60: return tr("60", "Frame limit");
 		case frame_limit_type::_30: return tr("30", "Frame limit");
 		case frame_limit_type::_auto: return tr("Auto", "Frame limit");
+		case frame_limit_type::_ps3: return tr("PS3 Native", "Frame limit");
 		}
 		break;
 	case emu_settings_type::MSAA:
@@ -1027,6 +1028,20 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		case camera_handler::qt: return tr("Qt", "Camera handler");
 		}
 		break;
+	case emu_settings_type::MusicHandler:
+		switch (static_cast<music_handler>(index))
+		{
+		case music_handler::null: return tr("Null", "Music handler");
+		case music_handler::qt: return tr("Qt", "Music handler");
+		}
+		break;
+	case emu_settings_type::PadHandlerMode:
+		switch (static_cast<pad_handler_mode>(index))
+		{
+		case pad_handler_mode::single_threaded: return tr("Single-threaded", "Pad handler mode");
+		case pad_handler_mode::multi_threaded: return tr("Multi-threaded", "Pad handler mode");
+		}
+		break;
 	case emu_settings_type::Move:
 		switch (static_cast<move_handler>(index))
 		{
@@ -1082,6 +1097,15 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		case sleep_timers_accuracy_level::_all_timers: return tr("All Timers", "Sleep timers accuracy");
 		}
 		break;
+	case emu_settings_type::FIFOAccuracy:
+		switch (static_cast<rsx_fifo_mode>(index))
+		{
+		case rsx_fifo_mode::fast: return tr("Fast", "RSX FIFO Accuracy");
+		case rsx_fifo_mode::atomic: return tr("Atomic", "RSX FIFO Accuracy");
+		case rsx_fifo_mode::atomic_ordered: return tr("Ordered & Atomic", "RSX FIFO Accuracy");
+		case rsx_fifo_mode::as_ps3: return tr("PS3", "RSX FIFO Accuracy");
+		}
+		break;
 	case emu_settings_type::PerfOverlayDetailLevel:
 		switch (static_cast<detail_level>(index))
 		{
@@ -1104,16 +1128,16 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 	case emu_settings_type::PPUDecoder:
 		switch (static_cast<ppu_decoder_type>(index))
 		{
-		case ppu_decoder_type::precise: return tr("Interpreter (precise)", "PPU decoder");
-		case ppu_decoder_type::fast: return tr("Interpreter (fast)", "PPU decoder");
+		case ppu_decoder_type::_static: return tr("Interpreter (static)", "PPU decoder");
+		case ppu_decoder_type::dynamic: return tr("Interpreter (dynamic)", "PPU decoder");
 		case ppu_decoder_type::llvm: return tr("Recompiler (LLVM)", "PPU decoder");
 		}
 		break;
 	case emu_settings_type::SPUDecoder:
 		switch (static_cast<spu_decoder_type>(index))
 		{
-		case spu_decoder_type::precise: return tr("Interpreter (precise)", "SPU decoder");
-		case spu_decoder_type::fast: return tr("Interpreter (fast)", "SPU decoder");
+		case spu_decoder_type::_static: return tr("Interpreter (static)", "SPU decoder");
+		case spu_decoder_type::dynamic: return tr("Interpreter (dynamic)", "SPU decoder");
 		case spu_decoder_type::asmjit: return tr("Recompiler (ASMJIT)", "SPU decoder");
 		case spu_decoder_type::llvm: return tr("Recompiler (LLVM)", "SPU decoder");
 		}
@@ -1125,13 +1149,24 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		case enter_button_assign::cross: return tr("Enter with cross", "Enter button assignment");
 		}
 		break;
-	case emu_settings_type::AudioChannels:
-		switch (static_cast<audio_downmix>(index))
+	case emu_settings_type::AudioFormat:
+		switch (static_cast<audio_format>(index))
 		{
-		case audio_downmix::no_downmix: return tr("Surround 7.1", "Audio downmix");
-		case audio_downmix::downmix_to_stereo: return tr("Downmix to Stereo", "Audio downmix");
-		case audio_downmix::downmix_to_5_1: return tr("Downmix to 5.1", "Audio downmix");
-		case audio_downmix::use_application_settings: return tr("Use application settings", "Audio downmix");
+		case audio_format::stereo: return tr("Stereo", "Audio format");
+		case audio_format::surround_5_1: return tr("Surround 5.1", "Audio format");
+		case audio_format::surround_7_1: return tr("Surround 7.1", "Audio format");
+		case audio_format::manual: return tr("Manual", "Audio format");
+		case audio_format::automatic: return tr("Automatic", "Audio format");
+		}
+		break;
+	case emu_settings_type::AudioFormats:
+		switch (static_cast<audio_format_flag>(index))
+		{
+		case audio_format_flag::lpcm_2_48khz: return tr("Linear PCM 2 Ch. 48 kHz", "Audio format flag");
+		case audio_format_flag::lpcm_5_1_48khz: return tr("Linear PCM 5.1 Ch. 48 kHz", "Audio format flag");
+		case audio_format_flag::lpcm_7_1_48khz: return tr("Linear PCM 7.1 Ch. 48 kHz", "Audio format flag");
+		case audio_format_flag::ac3: return tr("Dolby Digital 5.1 Ch.", "Audio format flag");
+		case audio_format_flag::dts: return tr("DTS 5.1 Ch.", "Audio format flag");
 		}
 		break;
 	case emu_settings_type::LicenseArea:
@@ -1144,6 +1179,13 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		case CellSysutilLicenseArea::CELL_SYSUTIL_LICENSE_AREA_K: return tr("Korea", "License Area");
 		case CellSysutilLicenseArea::CELL_SYSUTIL_LICENSE_AREA_C: return tr("China", "License Area");
 		case CellSysutilLicenseArea::CELL_SYSUTIL_LICENSE_AREA_OTHER: return tr("Other", "License Area");
+		}
+		break;
+	case emu_settings_type::VulkanAsyncSchedulerDriver:
+		switch (static_cast<vk_gpu_scheduler_mode>(index))
+		{
+		case vk_gpu_scheduler_mode::safe: return tr("Safe");
+		case vk_gpu_scheduler_mode::fast: return tr("Fast");
 		}
 		break;
 	default:

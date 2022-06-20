@@ -98,6 +98,9 @@ struct UsbTransfer
 	libusb_transfer* transfer = nullptr;
 	bool busy                 = false;
 
+	// For control transfers
+	u8 *control_destbuf = nullptr;
+
 	// For fake transfers
 	bool fake           = false;
 	u64 expected_time   = 0;
@@ -167,6 +170,7 @@ class usb_device
 {
 public:
 	usb_device(const std::array<u8, 7>& location);
+	virtual ~usb_device() = default;
 
 	virtual bool open_device() = 0;
 

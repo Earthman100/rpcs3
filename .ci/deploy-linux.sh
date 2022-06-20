@@ -18,6 +18,11 @@ if [ "$DEPLOY_APPIMAGE" = "true" ]; then
     # Embed newer libstdc++ for distros that don't come with it (ubuntu 16.04)
     mkdir -p appdir/usr/optional/ ; mkdir -p appdir/usr/optional/libstdc++/
     cp /usr/lib/x86_64-linux-gnu/libstdc++.so.6 ./appdir/usr/optional/libstdc++/
+    
+    # Remove libwayland-client because it has platform-dependent exports and breaks other OSes
+    rm -f ./appdir/usr/lib/libwayland-client.so*
+    
+    # Install latest appimage runner
     rm ./appdir/AppRun
     curl -sL https://github.com/RPCS3/AppImageKit-checkrt/releases/download/continuous2/AppRun-patched-x86_64 -o ./appdir/AppRun
     chmod a+x ./appdir/AppRun
@@ -37,7 +42,7 @@ if [ "$DEPLOY_APPIMAGE" = "true" ]; then
     
     ls
 
-    COMM_TAG="$(grep 'version{.*}' ../rpcs3/rpcs3_version.cpp | awk -F[\{,] '{printf "%d.%d.%d", $2, $3, $4}')"
+    COMM_TAG=$(awk '/version{.*}/ { printf("%d.%d.%d", $5, $6, $7) }' ../rpcs3/rpcs3_version.cpp)
     COMM_COUNT="$(git rev-list --count HEAD)"
     COMM_HASH="$(git rev-parse --short=8 HEAD)"
     RPCS3_APPIMAGE="rpcs3-v${COMM_TAG}-${COMM_COUNT}-${COMM_HASH}_linux64.AppImage"

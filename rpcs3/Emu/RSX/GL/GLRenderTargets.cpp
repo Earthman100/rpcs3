@@ -382,7 +382,7 @@ void GLGSRender::init_buffers(rsx::framebuffer_creation_context context, bool /*
 
 			m_gl_texture_cache.lock_memory_region(
 				cmd, surface, surface->get_memory_range(), false,
-				surface->get_surface_width(rsx::surface_metrics::pixels), surface->get_surface_height(rsx::surface_metrics::pixels), surface->get_rsx_pitch(),
+				surface->get_surface_width<rsx::surface_metrics::pixels>(), surface->get_surface_height<rsx::surface_metrics::pixels>(), surface->get_rsx_pitch(),
 				format, type, swap_bytes);
 		}
 
@@ -425,12 +425,12 @@ void gl::render_target::load_memory(gl::command_context& cmd)
 	// TODO: MSAA support
 	if (g_cfg.video.resolution_scale_percent == 100 && spp == 1) [[likely]]
 	{
-		gl::upload_texture(this, get_gcm_format(), is_swizzled, { subres });
+		gl::upload_texture(cmd, this, get_gcm_format(), is_swizzled, { subres });
 	}
 	else
 	{
 		auto tmp = std::make_unique<gl::texture>(GL_TEXTURE_2D, subres.width_in_block, subres.height_in_block, 1, 1, static_cast<GLenum>(get_internal_format()), format_class());
-		gl::upload_texture(tmp.get(), get_gcm_format(), is_swizzled, { subres });
+		gl::upload_texture(cmd, tmp.get(), get_gcm_format(), is_swizzled, { subres });
 
 		gl::g_hw_blitter->scale_image(cmd, tmp.get(), this,
 			{ 0, 0, subres.width_in_block, subres.height_in_block },
@@ -507,8 +507,7 @@ void gl::render_target::memory_barrier(gl::command_context& cmd, rsx::surface_ac
 		else
 		{
 			// Mem cast, generate typeless xfer info
-			if (!formats_are_bitcast_compatible(static_cast<GLenum>(get_internal_format()), static_cast<GLenum>(src_texture->get_internal_format())) ||
-				aspect() != src_texture->aspect())
+			if (!formats_are_bitcast_compatible(this, src_texture))
 			{
 				typeless_info.src_is_typeless = true;
 				typeless_info.src_context = rsx::texture_upload_context::framebuffer_storage;

@@ -7,6 +7,7 @@
 #include "Utilities/File.h"
 #include "Emu/System.h"
 #include "Emu/system_utils.hpp"
+#include "Crypto/utils.h"
 #include "util/logs.hpp"
 
 #include <QApplication>
@@ -191,7 +192,7 @@ bool update_manager::handle_json(bool automatic, bool check_only, bool auto_acce
 		}
 		else
 		{
-			m_update_message = tr("A new version of RPCS3 is available!\n\nCurrent version: %0 (%1)\nLatest version: %2 (%3)\nYour version is %4 old.\n\nDo you want to update?")
+			m_update_message = tr("A new version of RPCS3 is available!\n\nCurrent version: %0 (%1)\nLatest version: %2 (%3)\nYour version is %4 behind.\n\nDo you want to update?")
 				.arg(current["version"].toString())
 				.arg(cur_str)
 				.arg(latest["version"].toString())
@@ -220,12 +221,6 @@ bool update_manager::handle_json(bool automatic, bool check_only, bool auto_acce
 	}
 
 	update_log.notice("Update found: %s", m_request_url);
-
-	if (check_only)
-	{
-		m_downloader->close_progress_dialog();
-		return true;
-	}
 
 	if (!auto_accept)
 	{
@@ -277,6 +272,12 @@ bool update_manager::handle_json(bool automatic, bool check_only, bool auto_acce
 		}
 	}
 
+	if (check_only)
+	{
+		m_downloader->close_progress_dialog();
+		return true;
+	}
+
 	update(auto_accept);
 	return true;
 }
@@ -302,7 +303,7 @@ void update_manager::update(bool auto_accept)
 			changelog_content.append(tr("• %0: %1").arg(entry.version, entry.title));
 		}
 
-		QMessageBox mb(QMessageBox::Icon::Question, tr("Update Available"), m_update_message, QMessageBox::Yes | QMessageBox::No,m_downloader->get_progress_dialog() ? m_downloader->get_progress_dialog() : m_parent);
+		QMessageBox mb(QMessageBox::Icon::Question, tr("Update Available"), m_update_message, QMessageBox::Yes | QMessageBox::No, m_downloader->get_progress_dialog() ? m_downloader->get_progress_dialog() : m_parent);
 
 		if (!changelog_content.isEmpty())
 		{
@@ -361,13 +362,18 @@ bool update_manager::handle_rpcs3(const QByteArray& data, bool auto_accept)
 {
 	m_downloader->update_progress_dialog(tr("Updating RPCS3"));
 
+#ifdef __APPLE__
+	update_log.error("Unsupported operating system.");
+	return false;
+#else
+
 	if (m_expected_size != static_cast<u64>(data.size()))
 	{
 		update_log.error("Download size mismatch: %d expected: %d", data.size(), m_expected_size);
 		return false;
 	}
 
-	if (const std::string res_hash_string = downloader::get_hash(data.data(), data.size(), false);
+	if (const std::string res_hash_string = sha256_get_hash(data.data(), data.size(), false);
 		m_expected_hash != res_hash_string)
 	{
 		update_log.error("Hash mismatch: %s expected: %s", res_hash_string, m_expected_hash);
@@ -584,39 +590,23 @@ bool update_manager::handle_rpcs3(const QByteArray& data, bool auto_accept)
 
 #else
 
-	std::string replace_path;
-
-	const char* appimage_path = ::getenv("APPIMAGE");
-	if (appimage_path != nullptr)
+	std::string replace_path = rpcs3::utils::get_executable_path();
+	if (replace_path.empty())
 	{
-		replace_path = appimage_path;
-		update_log.notice("Found AppImage path: %s", appimage_path);
-	}
-	else
-	{
-		update_log.warning("Failed to find AppImage path");
-		char exe_path[PATH_MAX];
-		ssize_t len = ::readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-
-		if (len == -1)
-		{
-			update_log.error("Failed to find executable path");
-			return false;
-		}
-
-		exe_path[len] = '\0';
-		update_log.trace("Found exec path: %s", exe_path);
-
-		replace_path = exe_path;
+		return false;
 	}
 
 	// Move the appimage/exe and replace with new appimage
 	const std::string move_dest = replace_path + "_old";
-	fs::rename(replace_path, move_dest, true);
+	if (!fs::rename(replace_path, move_dest, true))
+	{
+		// Simply log error for now
+		update_log.error("Failed to move old AppImage file: %s (%s)", replace_path, fs::g_tls_error);
+	}
 	fs::file new_appimage(replace_path, fs::read + fs::write + fs::create + fs::trunc);
 	if (!new_appimage)
 	{
-		update_log.error("Failed to create new AppImage file: %s", replace_path);
+		update_log.error("Failed to create new AppImage file: %s (%s)", replace_path, fs::g_tls_error);
 		return false;
 	}
 	if (new_appimage.write(data.data(), data.size()) != data.size() + 0u)
@@ -626,7 +616,7 @@ bool update_manager::handle_rpcs3(const QByteArray& data, bool auto_accept)
 	}
 	if (fchmod(new_appimage.get_handle(), S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) == -1)
 	{
-		update_log.error("Failed to chmod rwxrxrx %s", replace_path);
+		update_log.error("Failed to chmod rwxrxrx %s (%s)", replace_path, strerror(errno));
 		return false;
 	}
 	new_appimage.close();
@@ -655,14 +645,15 @@ bool update_manager::handle_rpcs3(const QByteArray& data, bool auto_accept)
 		QMessageBox::information(m_parent, tr("Auto-updater"), tr("Update successful!\nRPCS3 will now restart."));
 	}
 
-	Emu.SetForceBoot(true);
-	Emu.Stop();
+	Emu.GracefulShutdown(false);
 	Emu.CleanUp();
 
 #ifdef _WIN32
-	const int ret = _wexecl(wchar_orig_path.data(), L"--updating", nullptr);
+	const int ret = _wexecl(wchar_orig_path.data(), wchar_orig_path.data(), L"--updating", nullptr);
 #else
-	const int ret = execl(replace_path.c_str(), "--updating", nullptr);
+	// execv is used for compatibility with checkrt
+	const char * const params[3] = { replace_path.c_str(), "--updating", nullptr };
+	const int ret = execv(replace_path.c_str(), const_cast<char * const *>(&params[0]));
 #endif
 	if (ret == -1)
 	{
@@ -671,4 +662,5 @@ bool update_manager::handle_rpcs3(const QByteArray& data, bool auto_accept)
 	}
 
 	return true;
+#endif //def __APPLE__
 }

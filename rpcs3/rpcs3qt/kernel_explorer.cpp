@@ -26,8 +26,10 @@
 #include "Emu/Cell/lv2/sys_rsx.h"
 #include "Emu/Cell/lv2/sys_vm.h"
 #include "Emu/Cell/lv2/sys_net.h"
+#include "Emu/Cell/lv2/sys_net/lv2_socket.h"
 #include "Emu/Cell/lv2/sys_fs.h"
 #include "Emu/Cell/lv2/sys_interrupt.h"
+#include "Emu/Cell/lv2/sys_rsxaudio.h"
 #include "Emu/Cell/Modules/cellSpurs.h"
 
 #include "Emu/RSX/RSXThread.h"
@@ -241,6 +243,7 @@ void kernel_explorer::update()
 		{ SYS_FS_FD_OBJECT               , tr("File Descriptors")},
 		{ SYS_LWCOND_OBJECT              , tr("Light Weight Condition Variables")},
 		{ SYS_EVENT_FLAG_OBJECT          , tr("Event Flags")},
+		{ SYS_RSXAUDIO_OBJECT            , tr("RSXAudio Objects")},
 
 		{ memory_containers              , tr("Memory Containers")},
 		{ ppu_threads                    , tr("PPU Threads")},
@@ -531,6 +534,25 @@ void kernel_explorer::update()
 				ef.type, ef.key, ef.pattern.load(), +ef.waiters)));
 			break;
 		}
+		case SYS_RSXAUDIO_OBJECT:
+		{
+			auto& rao = static_cast<lv2_rsxaudio&>(obj);
+			std::lock_guard lock(rao.mutex);
+			if (!rao.init)
+			{
+				break;
+			}
+
+			QTreeWidgetItem* rao_obj = add_leaf(node, qstr(fmt::format(u8"RSXAudio 0x%08x: Shmem: 0x%08x", id, u32{rao.shmem})));
+			for (u64 q_idx = 0; q_idx < rao.event_queue.size(); q_idx++)
+			{
+				if (const auto eq = rao.event_queue[q_idx].lock())
+				{
+					add_leaf(rao_obj, qstr(fmt::format(u8"Event Queue %u: ID: 0x%08x", q_idx, eq->id)));
+				}
+			}
+			break;
+		}
 		default:
 		{
 			add_leaf(node, qstr(fmt::format("Unknown object 0x%08x", id)));
@@ -547,7 +569,7 @@ void kernel_explorer::update()
 
 	idm::select<lv2_socket>([&](u32 id, lv2_socket& sock)
 	{
-		add_leaf(find_node(root, additional_nodes::sockets), qstr(fmt::format("Socket %u: Type: %s, Family: %s, Wq: %zu", id, sock.type, sock.family, sock.queue.size())));
+		add_leaf(find_node(root, additional_nodes::sockets), qstr(fmt::format("Socket %u: Type: %s, Family: %s, Wq: %zu", id, sock.get_type(), sock.get_family(), sock.get_queue_size())));
 	});
 
 	idm::select<lv2_memory_container>([&](u32 id, lv2_memory_container& container)

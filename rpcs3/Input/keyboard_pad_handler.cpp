@@ -138,25 +138,34 @@ void keyboard_pad_handler::Key(const u32 code, bool pressed, u16 value)
 			const bool is_max = pad.m_sticks[i].m_keyCodeMax == code;
 			const bool is_min = pad.m_sticks[i].m_keyCodeMin == code;
 
-			const u16 normalized_value = std::max<u16>(1, static_cast<u16>(std::floor(value / 2.0)));
+			if (!is_max && !is_min)
+			{
+				continue;
+			}
+
+			const bool is_left_stick = i < 2;
+
+			if (pressed)
+			{
+				value = MultipliedInput(value, is_left_stick ? m_l_stick_multiplier : m_r_stick_multiplier);
+			}
+
+			const u16 normalized_value = std::ceil(value / 2.0);
 
 			if (is_max)
-				m_stick_max[i] = pressed ? 128 + normalized_value : 128;
+				m_stick_max[i] = pressed ? std::min<int>(128 + normalized_value, 255) : 128;
 
 			if (is_min)
-				m_stick_min[i] = pressed ? normalized_value : 0;
+				m_stick_min[i] = pressed ? std::min<u8>(normalized_value, 128) : 0;
 
-			if (is_max || is_min)
+			m_stick_val[i] = m_stick_max[i] - m_stick_min[i];
+
+			const f32 stick_lerp_factor = is_left_stick ? m_l_stick_lerp_factor : m_r_stick_lerp_factor;
+
+			// to get the fastest response time possible we don't wanna use any lerp with factor 1
+			if (stick_lerp_factor >= 1.0f)
 			{
-				m_stick_val[i] = m_stick_max[i] - m_stick_min[i];
-
-				const f32 stick_lerp_factor = (i < 2) ? m_l_stick_lerp_factor : m_r_stick_lerp_factor;
-
-				// to get the fastest response time possible we don't wanna use any lerp with factor 1
-				if (stick_lerp_factor >= 1.0f)
-				{
-					pad.m_sticks[i].m_value = m_stick_val[i];
-				}
+				pad.m_sticks[i].m_value = m_stick_val[i];
 			}
 		}
 	}
@@ -290,6 +299,7 @@ void keyboard_pad_handler::processKeyEvent(QKeyEvent* event, bool pressed)
 	case Qt::Key_S:
 	case Qt::Key_R:
 	case Qt::Key_E:
+	case Qt::Key_0:
 		if (event->modifiers() != Qt::ControlModifier)
 			handle_key();
 		break;
@@ -405,10 +415,28 @@ void keyboard_pad_handler::mouseMoveEvent(QMouseEvent* event)
 		// get the delta of the mouse position to the screen center
 		const QPoint p_delta = event->pos() - p_center;
 
-		movement_x = p_delta.x();
-		movement_y = p_delta.y();
+		if (m_mouse_movement_mode == mouse_movement_mode::relative)
+		{
+			movement_x = p_delta.x();
+			movement_y = p_delta.y();
+		}
+		else
+		{
+			// current mouse position, starting at the center
+			static QPoint p_real(p_center);
+
+			// update the current position without leaving the screen borders
+			p_real.setX(std::clamp(p_real.x() + p_delta.x(), 0, screen.width()));
+			p_real.setY(std::clamp(p_real.y() + p_delta.y(), 0, screen.height()));
+
+			// get the delta of the real mouse position to the screen center
+			const QPoint p_real_delta = p_real - p_center;
+
+			movement_x = p_real_delta.x();
+			movement_y = p_real_delta.y();
+		}
 	}
-	else
+	else if (m_mouse_movement_mode == mouse_movement_mode::relative)
 	{
 		static int last_pos_x = 0;
 		static int last_pos_y = 0;
@@ -418,6 +446,23 @@ void keyboard_pad_handler::mouseMoveEvent(QMouseEvent* event)
 
 		last_pos_x = event->x();
 		last_pos_y = event->y();
+	}
+	else if (m_target && m_target->isActive())
+	{
+		// get the screen dimensions
+		const QSize screen = m_target->size();
+
+		// get the center of the screen in global coordinates
+		QPoint p_center = m_target->geometry().topLeft() + QPoint(screen.width() / 2, screen.height() / 2);
+
+		// convert the center into screen coordinates
+		p_center = m_target->mapFromGlobal(p_center);
+
+		// get the delta of the mouse position to the screen center
+		const QPoint p_delta = event->pos() - p_center;
+
+		movement_x = p_delta.x();
+		movement_y = p_delta.y();
 	}
 
 	movement_x *= m_multi_x;
@@ -629,6 +674,19 @@ std::string keyboard_pad_handler::GetKeyName(const QKeyEvent* keyEvent)
 		return "Meta";
 	case Qt::Key_NumLock:
 		return sstr(QKeySequence(keyEvent->key()).toString(QKeySequence::NativeText));
+#ifdef __APPLE__
+	// On macOS, the arrow keys are considered to be part of the keypad;
+	// since most Mac keyboards lack a keypad to begin with,
+	// we change them to regular arrows to avoid confusion
+	case Qt::Key_Left:
+		return "←";
+	case Qt::Key_Up:
+		return "↑";
+	case Qt::Key_Right:
+		return "→";
+	case Qt::Key_Down:
+		return "↓";
+#endif
 	default:
 		break;
 	}
@@ -661,6 +719,17 @@ u32 keyboard_pad_handler::GetKeyCode(const QString& keyName)
 		return Qt::Key_Control;
 	if (keyName == "Meta")
 		return Qt::Key_Meta;
+#ifdef __APPLE__
+	// QKeySequence doesn't work properly for the arrow keys on macOS
+	if (keyName == "Num←")
+		return Qt::Key_Left;
+	if (keyName == "Num↑")
+		return Qt::Key_Up;
+	if (keyName == "Num→")
+		return Qt::Key_Right;
+	if (keyName == "Num↓")
+		return Qt::Key_Down;
+#endif
 
 	const QKeySequence seq(keyName);
 	u32 key_code = 0;
@@ -717,7 +786,7 @@ std::string keyboard_pad_handler::native_scan_code_to_string(int native_scan_cod
 
 bool keyboard_pad_handler::bindPadToDevice(std::shared_ptr<Pad> pad, const std::string& device, u8 player_id)
 {
-	if (device != pad::keyboard_device_name)
+	if (!pad || device != pad::keyboard_device_name)
 		return false;
 
 	m_pad_configs[player_id].from_string(g_cfg_input.player[player_id]->config.to_string());
@@ -725,6 +794,7 @@ bool keyboard_pad_handler::bindPadToDevice(std::shared_ptr<Pad> pad, const std::
 	if (cfg == nullptr)
 		return false;
 
+	m_mouse_movement_mode = cfg->mouse_move_mode;
 	m_mouse_move_used = false;
 	m_mouse_wheel_used = false;
 	m_deadzone_x = cfg->mouse_deadzone_x;
@@ -735,6 +805,8 @@ bool keyboard_pad_handler::bindPadToDevice(std::shared_ptr<Pad> pad, const std::
 	m_r_stick_lerp_factor = cfg->r_stick_lerp_factor / 100.0f;
 	m_analog_lerp_factor  = cfg->analog_lerp_factor / 100.0f;
 	m_trigger_lerp_factor = cfg->trigger_lerp_factor / 100.0f;
+	m_l_stick_multiplier = cfg->lstickmultiplier;
+	m_r_stick_multiplier = cfg->rstickmultiplier;
 
 	const auto find_key = [this](const cfg::string& name)
 	{
@@ -836,7 +908,7 @@ void keyboard_pad_handler::ThreadProc()
 		m_button_time = now;
 	}
 
-	if (m_mouse_move_used)
+	if (m_mouse_move_used && m_mouse_movement_mode == mouse_movement_mode::relative)
 	{
 		static const double mouse_interval = 30.0;
 

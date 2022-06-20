@@ -9,6 +9,7 @@
 
 #include "vkutils/data_heap.h"
 #include "vkutils/image_helpers.h"
+#include "VKGSRender.h"
 
 #include "../GCM.h"
 #include "../rsx_utils.h"
@@ -41,7 +42,7 @@ namespace vk
 		}
 		else if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT)
 		{
-			return base_size * 2;
+			return (base_size * 6) / 2;
 		}
 		else
 		{
@@ -303,7 +304,7 @@ namespace vk
 		{
 			if (src->format_class() == dst->format_class())
 			{
-				rsx_log.error("[Performance warning] Image copy requested incorrectly for matching formats.");
+				rsx_log.warning("[Performance warning] Image copy requested incorrectly for matching formats.");
 				copy_image(cmd, src, dst, src_rect, dst_rect, mipmaps, src_transfer_mask, dst_transfer_mask);
 				return;
 			}
@@ -347,7 +348,7 @@ namespace vk
 		const auto min_scratch_size = calculate_working_buffer_size(src_length, src->aspect() | dst->aspect());
 
 		// Initialize scratch memory
-		auto scratch_buf = vk::get_scratch_buffer(min_scratch_size);
+		auto scratch_buf = vk::get_scratch_buffer(cmd, min_scratch_size);
 
 		for (u32 mip_level = 0; mip_level < mipmaps; ++mip_level)
 		{
@@ -417,7 +418,7 @@ namespace vk
 			src->format() != dst->format())
 		{
 			// Copying between two depth formats must match exactly or crashes will happen
-			rsx_log.error("[Performance warning] Image copy was requested incorrectly for mismatched depth formats");
+			rsx_log.warning("[Performance warning] Image copy was requested incorrectly for mismatched depth formats");
 			copy_image_typeless(cmd, src, dst, src_rect, dst_rect, mipmaps);
 			return;
 		}
@@ -552,7 +553,7 @@ namespace vk
 					const auto dst_w = dst_rect.width();
 					const auto dst_h = dst_rect.height();
 
-					auto scratch_buf = vk::get_scratch_buffer(std::max(src_w, dst_w) * std::max(src_h, dst_h) * 4);
+					auto scratch_buf = vk::get_scratch_buffer(cmd, std::max(src_w, dst_w) * std::max(src_h, dst_h) * 4);
 
 					//1. Copy unscaled to typeless surface
 					VkBufferImageCopy info{};
@@ -811,13 +812,28 @@ namespace vk
 		const vk::command_buffer* pcmd = nullptr;
 		if (flags & image_upload_options::upload_contents_async)
 		{
-			auto async_cmd = g_fxo->get<vk::async_scheduler_thread>().get_current();
+			auto& async_scheduler = g_fxo->get<AsyncTaskScheduler>();
+			auto async_cmd = async_scheduler.get_current();
 			async_cmd->begin();
 			pcmd = async_cmd;
 
 			if (!(flags & image_upload_options::preserve_image_layout))
 			{
 				flags |= image_upload_options::initialize_image_layout;
+			}
+
+			// Queue transfer stuff. Must release from primary if owned and acquire in secondary.
+			// Ignore queue transfers when running in the hacky "fast" mode. We're already violating spec there.
+			if (dst_image->current_layout != VK_IMAGE_LAYOUT_UNDEFINED && async_scheduler.is_host_mode())
+			{
+				// Release barrier
+				dst_image->queue_release(primary_cb, pcmd->get_queue_family(), dst_image->current_layout);
+
+				// Acquire barrier. This is not needed if we're going to be changing layouts later anyway (implicit acquire)
+				if (!(flags & image_upload_options::initialize_image_layout))
+				{
+					dst_image->queue_acquire(*pcmd, dst_image->current_layout);
+				}
 			}
 		}
 		else
@@ -834,7 +850,7 @@ namespace vk
 
 		if (flags & image_upload_options::initialize_image_layout)
 		{
-			dst_image->change_layout(*pcmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, pcmd->get_queue_family());
+			dst_image->change_layout(*pcmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 		}
 
 		return *pcmd;
@@ -999,7 +1015,13 @@ namespace vk
 						scratch_buf_size += dst_image->width() * dst_image->height() * 5;
 					}
 
-					scratch_buf = vk::get_scratch_buffer(scratch_buf_size);
+					// Must acquire scratch buffer owned by the processing command queue!
+					auto pdev = vk::get_current_renderer();
+					const u32 queue_family = (image_setup_flags & vk::upload_contents_async) ?
+						pdev->get_transfer_queue_family() :
+						pdev->get_graphics_queue_family();
+
+					scratch_buf = vk::get_scratch_buffer(queue_family, scratch_buf_size);
 					buffer_copies.reserve(subresource_layout.size());
 				}
 
@@ -1118,6 +1140,23 @@ namespace vk
 		else
 		{
 			vkCmdCopyBufferToImage(cmd2, upload_buffer->value, dst_image->value, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<u32>(copy_regions.size()), copy_regions.data());
+		}
+
+		if (cmd2.get_queue_family() != cmd.get_queue_family())
+		{
+			// Release from async chain, the primary chain will acquire later
+			dst_image->queue_release(cmd2, cmd.get_queue_family(), dst_image->current_layout);
+		}
+
+		if (auto rsxthr = rsx::get_current_renderer();
+			rsxthr->get_backend_config().supports_host_gpu_labels)
+		{
+			// Queue a sync update on the CB doing the load
+			auto [host_data, host_buffer] = static_cast<VKGSRender*>(rsxthr)->map_host_object_data();
+			ensure(host_data);
+			const auto event_id = host_data->inc_counter();
+			host_data->texture_load_request_event = event_id;
+			vkCmdUpdateBuffer(cmd2, host_buffer, ::offset32(&vk::host_data_t::texture_load_complete_event), sizeof(u64), &event_id);
 		}
 	}
 

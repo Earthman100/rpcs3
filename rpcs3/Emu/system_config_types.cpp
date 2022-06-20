@@ -188,6 +188,23 @@ void fmt_class_string<tsx_usage>::format(std::string& out, u64 arg)
 }
 
 template <>
+void fmt_class_string<rsx_fifo_mode>::format(std::string& out, u64 arg)
+{
+	format_enum(out, arg, [](rsx_fifo_mode value)
+	{
+		switch (value)
+		{
+		case rsx_fifo_mode::fast: return "Fast";
+		case rsx_fifo_mode::atomic: return "Atomic";
+		case rsx_fifo_mode::atomic_ordered: return "Ordered & Atomic";
+		case rsx_fifo_mode::as_ps3: return "PS3";
+		}
+
+		return unknown;
+	});
+}
+
+template <>
 void fmt_class_string<sleep_timers_accuracy_level>::format(std::string& out, u64 arg)
 {
 	format_enum(out, arg, [](sleep_timers_accuracy_level value)
@@ -256,8 +273,8 @@ void fmt_class_string<spu_decoder_type>::format(std::string& out, u64 arg)
 	{
 		switch (type)
 		{
-		case spu_decoder_type::precise: return "Interpreter (precise)";
-		case spu_decoder_type::fast: return "Interpreter (fast)";
+		case spu_decoder_type::_static: return "Interpreter (static)";
+		case spu_decoder_type::dynamic: return "Interpreter (dynamic)";
 		case spu_decoder_type::asmjit: return "Recompiler (ASMJIT)";
 		case spu_decoder_type::llvm: return "Recompiler (LLVM)";
 		}
@@ -295,6 +312,7 @@ void fmt_class_string<frame_limit_type>::format(std::string& out, u64 arg)
 		case frame_limit_type::_60: return "60";
 		case frame_limit_type::_30: return "30";
 		case frame_limit_type::_auto: return "Auto";
+		case frame_limit_type::_ps3: return "PS3 Native";
 		}
 
 		return unknown;
@@ -329,6 +347,21 @@ void fmt_class_string<camera_handler>::format(std::string& out, u64 arg)
 		case camera_handler::null: return "Null";
 		case camera_handler::fake: return "Fake";
 		case camera_handler::qt: return "Qt";
+		}
+
+		return unknown;
+	});
+}
+
+template <>
+void fmt_class_string<music_handler>::format(std::string& out, u64 arg)
+{
+	format_enum(out, arg, [](auto value)
+	{
+		switch (value)
+		{
+		case music_handler::null: return "Null";
+		case music_handler::qt: return "Qt";
 		}
 
 		return unknown;
@@ -379,6 +412,21 @@ void fmt_class_string<move_handler>::format(std::string& out, u64 arg)
 		case move_handler::null: return "Null";
 		case move_handler::fake: return "Fake";
 		case move_handler::mouse: return "Mouse";
+		}
+
+		return unknown;
+	});
+}
+
+template <>
+void fmt_class_string<pad_handler_mode>::format(std::string& out, u64 arg)
+{
+	format_enum(out, arg, [](auto value)
+	{
+		switch (value)
+		{
+		case pad_handler_mode::single_threaded: return "Single-threaded";
+		case pad_handler_mode::multi_threaded: return "Multi-threaded";
 		}
 
 		return unknown;
@@ -440,8 +488,8 @@ void fmt_class_string<ppu_decoder_type>::format(std::string& out, u64 arg)
 	{
 		switch (type)
 		{
-		case ppu_decoder_type::precise: return "Interpreter (precise)";
-		case ppu_decoder_type::fast: return "Interpreter (fast)";
+		case ppu_decoder_type::_static: return "Interpreter (static)";
+		case ppu_decoder_type::dynamic: return "Interpreter (dynamic)";
 		case ppu_decoder_type::llvm: return "Recompiler (LLVM)";
 		}
 
@@ -483,16 +531,35 @@ void fmt_class_string<audio_provider>::format(std::string& out, u64 arg)
 }
 
 template <>
-void fmt_class_string<audio_downmix>::format(std::string& out, u64 arg)
+void fmt_class_string<audio_avport>::format(std::string& out, u64 arg)
 {
-	format_enum(out, arg, [](audio_downmix value)
+	format_enum(out, arg, [](audio_avport value)
 	{
 		switch (value)
 		{
-		case audio_downmix::no_downmix: return "No downmix";
-		case audio_downmix::downmix_to_stereo: return "Downmix to Stereo";
-		case audio_downmix::downmix_to_5_1: return "Downmix to 5.1";
-		case audio_downmix::use_application_settings: return "Use application settings";
+		case audio_avport::hdmi_0: return "HDMI 0";
+		case audio_avport::hdmi_1: return "HDMI 1";
+		case audio_avport::avmulti: return "AV multiout";
+		case audio_avport::spdif_0: return "SPDIF 0";
+		case audio_avport::spdif_1: return "SPDIF 1";
+		}
+
+		return unknown;
+	});
+}
+
+template <>
+void fmt_class_string<audio_format>::format(std::string& out, u64 arg)
+{
+	format_enum(out, arg, [](audio_format value)
+	{
+		switch (value)
+		{
+		case audio_format::stereo: return "Stereo";
+		case audio_format::surround_5_1: return "Surround 5.1";
+		case audio_format::surround_7_1: return "Surround 7.1";
+		case audio_format::automatic: return "Automatic";
+		case audio_format::manual: return "Manual";
 		}
 
 		return unknown;
@@ -506,8 +573,8 @@ void fmt_class_string<vk_gpu_scheduler_mode>::format(std::string& out, u64 arg)
 	{
 		switch (value)
 		{
-		case vk_gpu_scheduler_mode::host: return "Host";
-		case vk_gpu_scheduler_mode::device: return "Device";
+		case vk_gpu_scheduler_mode::safe: return "Safe";
+		case vk_gpu_scheduler_mode::fast: return "Fast";
 		}
 
 		return unknown;
